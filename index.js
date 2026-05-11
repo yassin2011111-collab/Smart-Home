@@ -1,23 +1,27 @@
 require('dotenv').config();
-const net     = require('net');
-const http    = require('http');
+const http = require('http');
 const express = require('express');
-const cors    = require('cors');
-const path    = require('path');
+const cors = require('cors');
+const path = require('path');
 const { google } = require('googleapis');
-const { attachBroker, backendPublish, backendSubscribe, handleTcpClient } = require('./broker');
+const mqtt = require('mqtt');
 
 // ── Config ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-// Express binds internally on this port — never exposed externally
-const INTERNAL_HTTP_PORT = 3001;
 const SHEET_ID = process.env.SHEET_ID;
+
+// HiveMQ Cloud Credentials
+const MQTT_HOST = process.env.MQTT_HOST || '9d3c2efbd1594219aee390c520d4d949.s1.eu.hivemq.cloud';
+const MQTT_PORT = process.env.MQTT_PORT || 8883;
+const MQTT_WS_PORT = 8884;
+const MQTT_USERNAME = process.env.MQTT_USERNAME || 'yassin_ahmed';
+const MQTT_PASSWORD = process.env.MQTT_PASSWORD || 'Yassin2005';
 
 // ── Express App ───────────────────────────────────────────────
 const app = express();
 
-process.on('uncaughtException',  (err) => console.error('[System] Uncaught:', err.message));
-process.on('unhandledRejection', (r)   => console.error('[System] Rejection:', r));
+process.on('uncaughtException', (err) => console.error('[System] Uncaught:', err.message));
+process.on('unhandledRejection', (r) => console.error('[System] Rejection:', r));
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
@@ -43,15 +47,17 @@ async function logToSheet(room, event, state) {
   if (!SHEET_ID || !process.env.GOOGLE_SERVICE_ACCOUNT) return;
   try {
     const sheets = google.sheets({ version: 'v4', auth: getGoogleAuth() });
-    const now  = new Date();
+    const now = new Date();
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Sheet1!A:E',
       valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [[room, event, state,
-        now.toLocaleDateString('en-GB', { timeZone: 'Africa/Cairo' }),
-        now.toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }),
-      ]] },
+      requestBody: {
+        values: [[room, event, state,
+          now.toLocaleDateString('en-GB', { timeZone: 'Africa/Cairo' }),
+          now.toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }),
+        ]]
+      },
     });
     console.log(`[Sheets] ${room} | ${event} | ${state}`);
   } catch (e) { console.error('[Sheets]', e.message); }
@@ -66,26 +72,58 @@ async function getLogsFromSheet() {
   } catch (e) { console.error('[Sheets]', e.message); return []; }
 }
 
-// ── MQTT backend subscriptions ────────────────────────────────
-backendSubscribe('home/room1/motion', async (_, payload) => {
-  deviceState.room1.motion = payload.trim();
-  backendPublish('home/ui', JSON.stringify({ room: 'room1', event: 'motion', state: payload.trim(), devices: deviceState, time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }) }));
-  await logToSheet('Room 1', 'Motion', payload.trim());
+// ── HiveMQ Connection ─────────────────────────────────────────
+console.log(`[MQTT] Connecting to HiveMQ Cloud at mqtts://${MQTT_HOST}:${MQTT_PORT}`);
+const mqttClient = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
+  username: MQTT_USERNAME,
+  password: MQTT_PASSWORD,
+  clientId: 'farid_backend_' + Math.random().toString(16).substring(2, 8),
+  rejectUnauthorized: true, // required for HiveMQ Cloud TLS
 });
 
-backendSubscribe('home/room2/motion', async (_, payload) => {
-  deviceState.room2.motion = payload.trim();
-  backendPublish('home/ui', JSON.stringify({ room: 'room2', event: 'motion', state: payload.trim(), devices: deviceState, time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }) }));
-  await logToSheet('Room 2', 'Motion', payload.trim());
+mqttClient.on('connect', () => {
+  console.log('[MQTT] Connected to HiveMQ Cloud successfully!');
+  mqttClient.subscribe('home/room1/motion');
+  mqttClient.subscribe('home/room2/motion');
+  mqttClient.subscribe('home/request_status');
 });
 
-backendSubscribe('home/request_status', () => {
-  backendPublish('home/status', JSON.stringify({ devices: deviceState }), true);
+mqttClient.on('error', (err) => {
+  console.error('[MQTT] Connection Error:', err.message);
+});
+
+mqttClient.on('message', async (topic, payloadRaw) => {
+  const payload = payloadRaw.toString().trim();
+
+  if (topic === 'home/room1/motion') {
+    deviceState.room1.motion = payload;
+    mqttClient.publish('home/ui', JSON.stringify({ room: 'room1', event: 'motion', state: payload, devices: deviceState, time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }) }));
+    await logToSheet('Room 1', 'Motion', payload);
+  }
+
+  else if (topic === 'home/room2/motion') {
+    deviceState.room2.motion = payload;
+    mqttClient.publish('home/ui', JSON.stringify({ room: 'room2', event: 'motion', state: payload, devices: deviceState, time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }) }));
+    await logToSheet('Room 2', 'Motion', payload);
+  }
+
+  else if (topic === 'home/request_status') {
+    mqttClient.publish('home/status', JSON.stringify({ devices: deviceState }), { retain: true });
+  }
 });
 
 // ── REST API ──────────────────────────────────────────────────
-app.get('/api/status',  (req, res) => res.json({ success: true, devices: deviceState }));
-app.get('/api/health',  (req, res) => res.json({ status: 'ok', project: 'Farid Villa Smart Home' }));
+app.get('/api/mqtt-config', (req, res) => {
+  res.json({
+    host: MQTT_HOST,
+    port: MQTT_WS_PORT,
+    username: MQTT_USERNAME,
+    password: MQTT_PASSWORD
+  });
+});
+
+app.get('/api/status', (req, res) => res.json({ success: true, devices: deviceState }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', project: 'Farid Villa Smart Home' }));
 
 app.post('/api/control', async (req, res) => {
   const { room, state } = req.body;
@@ -95,9 +133,9 @@ app.post('/api/control', async (req, res) => {
   if (!['ON', 'OFF'].includes(s))
     return res.status(400).json({ success: false, message: 'State must be ON or OFF' });
 
-  backendPublish(`home/${room}/light`, s, true);
+  mqttClient.publish(`home/${room}/light`, s, { retain: true });
   deviceState[room].light = s;
-  backendPublish('home/ui', JSON.stringify({ room, event: 'light', state: s, devices: deviceState, time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }) }));
+  mqttClient.publish('home/ui', JSON.stringify({ room, event: 'light', state: s, devices: deviceState, time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }) }));
   await logToSheet(room === 'room1' ? 'Room 1' : 'Room 2', 'Light', s);
   res.json({ success: true, room, state: s });
 });
@@ -110,50 +148,9 @@ app.get('/api/logs', async (req, res) => {
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ── Start ─────────────────────────────────────────────────────
-// Step 1: Express listens on internal port (127.0.0.1 only — not exposed)
 const httpServer = http.createServer(app);
 
-// Attach WebSocket MQTT broker to the HTTP server
-attachBroker(httpServer);
-
-httpServer.listen(INTERNAL_HTTP_PORT, '127.0.0.1', () => {
-  console.log(`[HTTP] Express listening internally on ${INTERNAL_HTTP_PORT}`);
-
-  // Step 2: net.Server mux listens on Railway's PORT
-  // Detects protocol from first byte and routes:
-  //   MQTT (0x10–0x3F) → handleTcpClient (ESP32)
-  //   HTTP/WS          → proxy to 127.0.0.1:3001 (Express)
-  const mux = net.createServer((socket) => {
-    socket.once('data', (chunk) => {
-      const b = chunk[0];
-      const isMQTT = b >= 0x10 && b <= 0x3f;
-
-      if (isMQTT) {
-        // ESP32 raw MQTT connection
-        handleTcpClient(socket, chunk);
-      } else {
-        // HTTP / WebSocket — proxy to internal Express server
-        const proxy = net.connect(INTERNAL_HTTP_PORT, '127.0.0.1', () => {
-          proxy.write(chunk);           // replay first chunk
-          socket.pipe(proxy);
-          proxy.pipe(socket);
-        });
-        proxy.on('error', () => socket.destroy());
-        socket.on('error', () => proxy.destroy());
-      }
-    });
-
-    socket.on('error', () => {});
-  });
-
-  mux.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🏠  Farid Villa Smart Home`);
-    console.log(`🌐  Mux server on port ${PORT} (HTTP + WS + TCP MQTT)`);
-    console.log(`📡  TCP MQTT proxy active — Railway TCP proxy → port ${PORT}`);
-  });
-
-  mux.on('error', (err) => {
-    console.error('[Mux] Error:', err.message);
-    process.exit(1);
-  });
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🏠  Farid Villa Smart Home`);
+  console.log(`🌐  HTTP server successfully running on port ${PORT}`);
 });

@@ -464,16 +464,27 @@
     // ── MQTT Connection ──────────────────────────────────────────
     let mqttClient;
 
-    function initApp() {
-      // Connect to the same server via WebSocket
-      const WS_URL = window.location.protocol === 'https:'
-        ? `wss://${window.location.host}`
-        : `ws://${window.location.host}`;
+    async function initApp() {
+      // 1. Fetch HiveMQ Credentials from backend
+      let mqttConfig;
+      try {
+        const res = await fetch('/api/mqtt-config');
+        mqttConfig = await res.json();
+      } catch (err) {
+        console.error('Failed to fetch MQTT config', err);
+        setMqttStatus(false, 'Config Error');
+        return;
+      }
 
+      // 2. Connect to HiveMQ Cloud via Secure WebSocket
+      const WS_URL = `wss://${mqttConfig.host}:${mqttConfig.port}/mqtt`;
       const clientId = 'farid_web_' + Math.random().toString(16).slice(2, 8);
 
+      console.log('Connecting to HiveMQ Cloud...');
       const mqttClient = mqtt.connect(WS_URL, {
         clientId,
+        username: mqttConfig.username,
+        password: mqttConfig.password,
         clean: true,
         reconnectPeriod: 3000,
         connectTimeout: 10000,
@@ -485,7 +496,7 @@
         mqttClient.subscribe('home/status', { qos: 0 });
         // Request current state
         mqttClient.publish('home/request_status', '{}');
-        console.log('[MQTT] Connected');
+        console.log('[MQTT] Connected to HiveMQ Cloud');
       });
 
       mqttClient.on('reconnect', () => setMqttStatus(false, 'Reconnecting…'));
