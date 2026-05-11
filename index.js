@@ -7,8 +7,11 @@ const { google } = require('googleapis');
 const { attachBroker, backendPublish, backendSubscribe } = require('./broker');
 
 // ── Config ────────────────────────────────────────────────────
-const PORT     = process.env.PORT     || 3000;
-const TCP_PORT = process.env.TCP_PORT || 1883;  // ESP32 connects here (Railway TCP proxy)
+// Railway sets PORT automatically for the HTTP server.
+// TCP_PORT is a SEPARATE port for the MQTT TCP broker (ESP32 connects here).
+// On Railway: TCP Proxy must point to TCP_PORT (1884), NOT to PORT.
+const PORT     = process.env.PORT     || 3000;   // HTTP + WebSocket (Railway manages this)
+const TCP_PORT = process.env.TCP_PORT || 1884;   // MQTT TCP broker (Railway TCP proxy → this)
 const SHEET_ID = process.env.SHEET_ID;
 
 // ── Express App ───────────────────────────────────────────────
@@ -197,8 +200,12 @@ const server = http.createServer(app);
 server.listen(PORT, () => {
   console.log(`\n🏠  Farid Villa Smart Home`);
   console.log(`🌐  HTTP + WebSocket server on port ${PORT}`);
-  console.log(`📡  Attaching MQTT broker...`);
+  console.log(`📡  Attaching MQTT broker (TCP port ${TCP_PORT})...`);
+  // Attach MQTT broker AFTER HTTP server is listening
+  attachBroker(server, TCP_PORT);
 });
 
-// Attach MQTT broker (WebSocket on same HTTP server + TCP for ESP32)
-attachBroker(server, TCP_PORT);
+server.on('error', (err) => {
+  console.error(`[Server] HTTP server error: ${err.message}`);
+  process.exit(1);
+});
