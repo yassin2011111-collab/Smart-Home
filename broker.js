@@ -1,229 +1,183 @@
 /**
  * Farid Villa – Built-in MQTT Broker
  *
- * Two transports:
- *   1. WebSocket  — attached to the Express HTTP server (browser frontend)
- *   2. TCP        — dedicated server on TCP_INTERNAL_PORT (ESP32 via Railway proxy)
+ * Single port architecture — works on Railway's restricted environment.
  *
- * Railway TCP proxy points to TCP_INTERNAL_PORT (1883).
- * Railway HTTP port (PORT) is separate — no conflict.
+ * The HTTP server's underlying net.Server receives ALL TCP connections.
+ * We intercept BEFORE Node's HTTP parser by listening on the net.Server
+ * 'connection' event and peeking at the first byte:
+ *
+ *   0x10 = MQTT CONNECT → handle as raw MQTT (ESP32)
+ *   other = HTTP/WS     → let Node's HTTP server handle it normally
+ *
+ * WebSocket MQTT (browser) is handled via ws library on the HTTP server.
  */
 
-const net = require('net');
 const WebSocket = require('ws');
 
-// Internal TCP port for ESP32 MQTT connections
-// Railway TCP proxy must point to this port
-// NOTE: Railway blocks standard MQTT ports (1883, 1884, 1885)
-// Use a high port like 9001 instead
-const TCP_INTERNAL_PORT = parseInt(process.env.TCP_INTERNAL_PORT) || 9001;
-
 // ── State ─────────────────────────────────────────────────────
-const subscriptions = new Map(); // Map<client, string[]>
-const retained = new Map(); // Map<topic, Buffer>
-const backendHandlers = new Map(); // Map<topic, fn>
+const subscriptions   = new Map();
+const retained        = new Map();
+const backendHandlers = new Map();
 
 // ── MQTT Encoding ─────────────────────────────────────────────
-function encodeRemainingLength(length) {
-  const bytes = [];
+function encodeVarLen(n) {
+  const out = [];
   do {
-    let digit = length % 128;
-    length = Math.floor(length / 128);
-    if (length > 0) digit |= 0x80;
-    bytes.push(digit);
-  } while (length > 0);
-  return Buffer.from(bytes);
+    let b = n % 128;
+    n = Math.floor(n / 128);
+    if (n > 0) b |= 0x80;
+    out.push(b);
+  } while (n > 0);
+  return Buffer.from(out);
 }
 
-function parseRemainingLength(buffer, offset) {
-  let multiplier = 1, value = 0, bytes = 0, encodedByte;
+function decodeVarLen(buf, offset) {
+  let mult = 1, val = 0, i = 0, b;
   do {
-    if (offset + bytes >= buffer.length) return { length: 0, bytes: 1 };
-    encodedByte = buffer[offset + bytes];
-    value += (encodedByte & 0x7f) * multiplier;
-    multiplier *= 128;
-    bytes++;
-  } while ((encodedByte & 0x80) !== 0 && bytes < 4);
-  return { length: value, bytes };
+    if (offset + i >= buf.length) return { len: 0, bytes: 1 };
+    b = buf[offset + i];
+    val += (b & 0x7f) * mult;
+    mult *= 128;
+    i++;
+  } while ((b & 0x80) && i < 4);
+  return { len: val, bytes: i };
 }
 
-// ── Packet Builders ───────────────────────────────────────────
-const CONNACK = Buffer.from([0x20, 0x02, 0x00, 0x00]);
+// ── Packet builders ───────────────────────────────────────────
+const CONNACK  = Buffer.from([0x20, 0x02, 0x00, 0x00]);
 const PINGRESP = Buffer.from([0xd0, 0x00]);
 
-function buildSuback(packetId) {
-  return Buffer.concat([Buffer.from([0x90, 0x03]), packetId, Buffer.from([0x00])]);
+function suback(pid) {
+  return Buffer.concat([Buffer.from([0x90, 0x03]), pid, Buffer.from([0x00])]);
 }
 
-function buildPublish(topic, payload, retain = false) {
-  const t = Buffer.from(topic, 'utf8');
-  const p = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8');
+function pubPacket(topic, payload, retain) {
+  const t = Buffer.from(topic);
+  const p = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload));
   const rl = 2 + t.length + p.length;
   return Buffer.concat([
     Buffer.from([retain ? 0x31 : 0x30]),
-    encodeRemainingLength(rl),
+    encodeVarLen(rl),
     Buffer.from([t.length >> 8, t.length & 0xff]),
     t, p,
   ]);
 }
 
 // ── Send ──────────────────────────────────────────────────────
-function send(client, packet) {
-  if (!client) return;
+function send(client, pkt) {
   try {
-    if (typeof client.write === 'function' && !client.destroyed) {
-      client.write(packet);
-    } else if (typeof client.send === 'function' && client.readyState === WebSocket.OPEN) {
-      client.send(packet);
-    }
-  } catch (_) { }
+    if (client && typeof client.write === 'function' && !client.destroyed)
+      client.write(pkt);
+    else if (client && typeof client.send === 'function' && client.readyState === WebSocket.OPEN)
+      client.send(pkt);
+  } catch (_) {}
 }
 
-// ── Subscriptions ─────────────────────────────────────────────
-function subscribe(client, topic) {
+// ── Pub/Sub ───────────────────────────────────────────────────
+function addSub(client, topic) {
   if (!subscriptions.has(client)) subscriptions.set(client, []);
   const list = subscriptions.get(client);
   if (!list.includes(topic)) list.push(topic);
 }
 
-function remove(client) {
-  subscriptions.delete(client);
-}
+function drop(client) { subscriptions.delete(client); }
 
-// ── Publish ───────────────────────────────────────────────────
 function publish(topic, payload, retain = false) {
   if (retain) {
     payload.length === 0 ? retained.delete(topic) : retained.set(topic, payload);
   }
-  const pkt = buildPublish(topic, payload);
-  for (const [client, topics] of subscriptions) {
-    if (topics.includes(topic)) send(client, pkt);
-  }
+  const pkt = pubPacket(topic, payload);
+  for (const [c, topics] of subscriptions)
+    if (topics.includes(topic)) send(c, pkt);
+
   console.log(`[Broker] >> ${topic}: ${payload.toString().slice(0, 80)}`);
 
   const h = backendHandlers.get(topic);
-  if (h) { try { h(topic, payload.toString()); } catch (e) { console.error('[Broker] handler:', e.message); } }
+  if (h) try { h(topic, payload.toString()); } catch (e) { console.error('[Broker]', e.message); }
 }
 
-// ── MQTT Packet Parser ────────────────────────────────────────
-function onConnect(client, buf, offset) {
-  try {
-    const pnLen = (buf[offset] << 8) | buf[offset + 1];
-    offset += 2 + pnLen + 4;
-    const cidLen = (buf[offset] << 8) | buf[offset + 1];
-    const cid = buf.slice(offset + 2, offset + 2 + cidLen).toString();
-    console.log(`[Broker] CONNECT ${cid}`);
-  } catch (_) { console.log('[Broker] CONNECT'); }
-  send(client, CONNACK);
-}
-
-function onSubscribe(client, buf, offset, remLen) {
-  const end = offset + remLen;
-  const pid = buf.slice(offset, offset + 2);
-  offset += 2;
-  while (offset < end) {
-    const tl = (buf[offset] << 8) | buf[offset + 1];
-    offset += 2;
-    const topic = buf.slice(offset, offset + tl).toString();
-    offset += tl + 1;
-    subscribe(client, topic);
-    console.log(`[Broker] SUBSCRIBE ${topic}`);
-    if (retained.has(topic)) send(client, buildPublish(topic, retained.get(topic), true));
-  }
-  send(client, buildSuback(pid));
-}
-
-function onPublish(client, buf, offset, remLen, flags) {
-  const tl = (buf[offset] << 8) | buf[offset + 1];
-  const topic = buf.slice(offset + 2, offset + 2 + tl).toString();
-  const data = buf.slice(offset + 2 + tl, offset + remLen);
-  publish(topic, data, (flags & 0x01) !== 0);
-}
-
-function processBuffer(client, buffer) {
+// ── MQTT packet processing ────────────────────────────────────
+function processBuffer(client, buf) {
   let pos = 0;
-  while (pos < buffer.length) {
-    if (pos + 1 >= buffer.length) break;
-    const b0 = buffer[pos];
+  while (pos < buf.length) {
+    if (pos + 1 >= buf.length) break;
+    const b0  = buf[pos];
     const typ = b0 >> 4;
     const flg = b0 & 0x0f;
-    const { length: remLen, bytes: lb } = parseRemainingLength(buffer, pos + 1);
-    const hLen = 1 + lb;
+    const { len: remLen, bytes: lb } = decodeVarLen(buf, pos + 1);
+    const hLen  = 1 + lb;
     const total = hLen + remLen;
-    if (pos + total > buffer.length) break;
+    if (pos + total > buf.length) break;
     const off = pos + hLen;
+
     switch (typ) {
-      case 1: onConnect(client, buffer, off); break;
-      case 3: onPublish(client, buffer, off, remLen, flg); break;
-      case 8: onSubscribe(client, buffer, off, remLen); break;
-      case 12: send(client, PINGRESP); break;
-      case 14: remove(client); break;
+      case 1: { // CONNECT
+        try {
+          const pnl = (buf[off] << 8) | buf[off + 1];
+          const cidOff = off + 2 + pnl + 4;
+          const cidLen = (buf[cidOff] << 8) | buf[cidOff + 1];
+          console.log('[Broker] CONNECT', buf.slice(cidOff + 2, cidOff + 2 + cidLen).toString());
+        } catch (_) { console.log('[Broker] CONNECT'); }
+        send(client, CONNACK);
+        break;
+      }
+      case 3: { // PUBLISH
+        const tl    = (buf[off] << 8) | buf[off + 1];
+        const topic = buf.slice(off + 2, off + 2 + tl).toString();
+        const data  = buf.slice(off + 2 + tl, off + remLen);
+        publish(topic, data, (flg & 0x01) !== 0);
+        break;
+      }
+      case 8: { // SUBSCRIBE
+        const end = off + remLen;
+        const pid = buf.slice(off, off + 2);
+        let i = off + 2;
+        while (i < end) {
+          const tl    = (buf[i] << 8) | buf[i + 1];
+          const topic = buf.slice(i + 2, i + 2 + tl).toString();
+          i += 2 + tl + 1;
+          addSub(client, topic);
+          console.log('[Broker] SUBSCRIBE', topic);
+          if (retained.has(topic)) send(client, pubPacket(topic, retained.get(topic), true));
+        }
+        send(client, suback(pid));
+        break;
+      }
+      case 12: send(client, PINGRESP); break; // PINGREQ
+      case 14: drop(client); break;           // DISCONNECT
     }
     pos += total;
   }
-  return pos;
 }
 
-// ── TCP client handler ────────────────────────────────────────
-function handleTcpClient(socket) {
-  console.log('[Broker] TCP connected:', socket.remoteAddress);
+// ── Handle a raw TCP MQTT socket (ESP32) ──────────────────────
+// Called by index.js mux with the socket and the already-read first chunk
+function handleTcpClient(socket, firstChunk) {
+  console.log('[Broker] ESP32 TCP connected:', socket.remoteAddress);
   subscriptions.set(socket, []);
-  let buf = Buffer.alloc(0);
-  let proxyStripped = false;
-  let isProxy = false;
+  let buf = firstChunk ? Buffer.from(firstChunk) : Buffer.alloc(0);
 
-  socket.on('data', (data) => {
-    buf = Buffer.concat([buf, data]);
+  // Process the first chunk immediately
+  if (buf.length > 0) {
+    processBuffer(socket, buf);
+    buf = Buffer.alloc(0);
+  }
 
-    if (!proxyStripped) {
-      if (!isProxy && buf.length >= 5 && buf.slice(0, 5).toString() === 'PROXY') {
-        isProxy = true;
-      }
-
-      if (isProxy) {
-        const headerEnd = buf.indexOf('\r\n');
-        if (headerEnd !== -1) {
-          console.log(`[Broker] Stripped PROXY header`);
-          buf = buf.slice(headerEnd + 2);
-          proxyStripped = true;
-        } else {
-          // Wait for more data to complete PROXY header
-          return;
-        }
-      } else {
-        // Not a proxy header, just proceed
-        proxyStripped = true;
-      }
-    }
-
-    if (buf.length === 0) return;
-
-    const consumed = processBuffer(socket, buf);
-    buf = buf.slice(consumed);
+  socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    processBuffer(socket, buf);
+    buf = Buffer.alloc(0);
   });
-
-  socket.on('close', () => { remove(socket); console.log('[Broker] TCP disconnected'); });
-  socket.on('error', (e) => { remove(socket); console.error('[Broker] TCP error:', e.message); });
-  socket.setTimeout(120000); // 2 min keepalive timeout
-  socket.on('timeout', () => socket.destroy());
-}
-
-// ── WebSocket client handler ──────────────────────────────────
-function handleWsClient(ws) {
-  console.log('[Broker] WS connected');
-  subscriptions.set(ws, []);
-
-  ws.on('message', (data) => {
-    processBuffer(ws, Buffer.isBuffer(data) ? data : Buffer.from(data));
-  });
-  ws.on('close', () => { remove(ws); console.log('[Broker] WS disconnected'); });
-  ws.on('error', () => remove(ws));
+  socket.on('close',   () => { drop(socket); console.log('[Broker] ESP32 disconnected'); });
+  socket.on('error',   () => drop(socket));
+  socket.setTimeout(0);
 }
 
 // ── Public API ────────────────────────────────────────────────
 function backendPublish(topic, payload, retain = false) {
   const str = typeof payload === 'object' ? JSON.stringify(payload) : String(payload);
-  publish(topic, Buffer.from(str, 'utf8'), retain);
+  publish(topic, Buffer.from(str), retain);
 }
 
 function backendSubscribe(topic, handler) {
@@ -231,33 +185,20 @@ function backendSubscribe(topic, handler) {
 }
 
 /**
- * Attach broker to HTTP server (WebSocket) and start dedicated TCP server
- * @param {http.Server} httpServer
+ * attachBroker(httpServer)
+ * Only handles WebSocket MQTT (browser).
+ * TCP MQTT (ESP32) is handled by handleTcpClient called from index.js mux.
  */
 function attachBroker(httpServer) {
-  // WebSocket MQTT — for browser
   const wss = new WebSocket.Server({ server: httpServer });
-  wss.on('connection', handleWsClient);
+  wss.on('connection', (ws) => {
+    console.log('[Broker] Browser WS connected');
+    subscriptions.set(ws, []);
+    ws.on('message', (data) => processBuffer(ws, Buffer.isBuffer(data) ? data : Buffer.from(data)));
+    ws.on('close',   () => { drop(ws); console.log('[Broker] Browser WS disconnected'); });
+    ws.on('error',   () => drop(ws));
+  });
   console.log('[Broker] WebSocket MQTT ready');
-
-  // TCP MQTT — for ESP32 (Railway TCP proxy → this port)
-  // We unconditionally start the TCP broker on 1883 (or TCP_INTERNAL_PORT)
-  let tcpPort = parseInt(process.env.TCP_INTERNAL_PORT) || 1883;
-
-  const tcpServer = net.createServer(handleTcpClient);
-
-  tcpServer.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`[Broker] TCP port ${tcpPort} in use — retrying in 3s`);
-      setTimeout(() => tcpServer.listen(tcpPort, '0.0.0.0'), 3000);
-    } else {
-      console.error('[Broker] TCP server error:', err.message);
-    }
-  });
-
-  tcpServer.listen(tcpPort, '0.0.0.0', () => {
-    console.log(`[Broker] TCP MQTT ready on port ${tcpPort}`);
-  });
 }
 
 module.exports = { attachBroker, backendPublish, backendSubscribe, handleTcpClient };
