@@ -159,6 +159,7 @@ function processBuffer(client, buffer) {
     }
     pos += total;
   }
+  return pos;
 }
 
 // ── TCP client handler ────────────────────────────────────────
@@ -195,8 +196,8 @@ function handleTcpClient(socket) {
 
     if (buf.length === 0) return;
 
-    processBuffer(socket, buf);
-    buf = Buffer.alloc(0);
+    const consumed = processBuffer(socket, buf);
+    buf = buf.slice(consumed);
   });
 
   socket.on('close', () => { remove(socket); console.log('[Broker] TCP disconnected'); });
