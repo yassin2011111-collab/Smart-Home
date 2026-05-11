@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Farid Villa – Smart Home</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet" />
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+    * { -webkit-font-smoothing: antialiased; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+      min-height: 100vh;
+    }
+
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background:
+        radial-gradient(circle at 20% 80%, rgba(59,130,246,0.12) 0%, transparent 50%),
+        radial-gradient(circle at 80% 20%, rgba(139,92,246,0.12) 0%, transparent 50%),
+        radial-gradient(circle at 50% 50%, rgba(34,197,94,0.05) 0%, transparent 60%);
+      pointer-events: none; z-index: 0;
+    }
+
+    .glass {
+      background: rgba(255,255,255,0.07);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255,255,255,0.1);
+      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.4);
+    }
+
+    .glass-dark {
+      background: rgba(15,23,42,0.7);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(148,163,184,0.15);
+    }
+
+    .card-hover {
+      transition: all 0.3s cubic-bezier(0.175,0.885,0.32,1.275);
+    }
+    .card-hover:hover {
+      transform: translateY(-6px) scale(1.02);
+      box-shadow: 0 40px 80px -20px rgba(0,0,0,0.5);
+    }
+
+    .nav-btn {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.08);
+      transition: all 0.25s ease;
+      color: rgba(255,255,255,0.85);
+    }
+    .nav-btn:hover { background: rgba(255,255,255,0.14); transform: translateY(-2px); }
+    .nav-btn.active {
+      background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+      border-color: transparent;
+      box-shadow: 0 15px 35px rgba(59,130,246,0.4);
+      color: white;
+    }
+
+    .light-card-on {
+      border-color: rgba(34,197,94,0.4) !important;
+      box-shadow: 0 0 30px rgba(34,197,94,0.12), 0 25px 50px -12px rgba(0,0,0,0.4) !important;
+    }
+    .light-card-on::before {
+      background: linear-gradient(90deg, #22c55e, #16a34a) !important;
+    }
+
+    .motion-detected {
+      border-color: rgba(239,68,68,0.5) !important;
+      animation: motion-pulse 1.2s ease-in-out infinite;
+    }
+    .motion-detected::before {
+      background: linear-gradient(90deg, #ef4444, #dc2626) !important;
+    }
+
+    @keyframes motion-pulse {
+      0%,100% { box-shadow: 0 0 15px rgba(239,68,68,0.1), 0 25px 50px -12px rgba(0,0,0,0.4); }
+      50%      { box-shadow: 0 0 35px rgba(239,68,68,0.35), 0 25px 50px -12px rgba(0,0,0,0.4); }
+    }
+
+    .status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      transition: background 0.3s;
+    }
+    .dot-on       { background: #22c55e; box-shadow: 0 0 8px #22c55e; animation: dot-pulse 2s infinite; }
+    .dot-off      { background: #ef4444; }
+    .dot-detected { background: #ef4444; box-shadow: 0 0 8px #ef4444; animation: dot-pulse 0.8s infinite; }
+    .dot-clear    { background: #64748b; }
+    .dot-mqtt-on  { background: #22c55e; box-shadow: 0 0 6px #22c55e; animation: dot-pulse 2s infinite; }
+    .dot-mqtt-off { background: #f59e0b; }
+
+    @keyframes dot-pulse {
+      0%,100% { opacity: 1; }
+      50%      { opacity: 0.5; }
+    }
+
+    .card-top-bar {
+      position: absolute; top: 0; left: 0; right: 0;
+      height: 3px; border-radius: 16px 16px 0 0;
+      background: rgba(255,255,255,0.1);
+      transition: background 0.3s;
+    }
+
+    .btn-on  { background: linear-gradient(135deg, #22c55e, #16a34a); }
+    .btn-off { background: linear-gradient(135deg, #ef4444, #dc2626); }
+    .btn-on:hover  { box-shadow: 0 8px 20px rgba(34,197,94,0.5); transform: translateY(-2px); }
+    .btn-off:hover { box-shadow: 0 8px 20px rgba(239,68,68,0.5); transform: translateY(-2px); }
+
+    .mono { font-family: 'JetBrains Mono', monospace; }
+
+    .table-row:hover {
+      background: rgba(255,255,255,0.06) !important;
+      transform: translateX(4px);
+    }
+    .table-row { transition: all 0.2s ease; }
+
+    .hidden { display: none !important; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .fade-in { animation: fadeIn 0.4s ease forwards; }
+  </style>
+</head>
+<body class="min-h-screen relative">
+
+  <!-- ── Navigation ── -->
+  <nav class="glass sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-6 h-20 flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-black text-lg">F</div>
+        <span class="text-white font-bold text-lg tracking-tight">Farid Villa</span>
+      </div>
+
+      <div class="flex gap-3">
+        <button onclick="showPage('home')" id="btn-home"
+          class="nav-btn active px-6 py-2.5 rounded-2xl font-semibold text-sm flex items-center gap-2">
+          <i class="fas fa-home"></i> Dashboard
+        </button>
+        <button onclick="showPage('logs')" id="btn-logs"
+          class="nav-btn px-6 py-2.5 rounded-2xl font-semibold text-sm flex items-center gap-2">
+          <i class="fas fa-list"></i> Activity Log
+        </button>
+      </div>
+
+      <div id="mqtt-pill" class="flex items-center gap-2 glass-dark px-4 py-2 rounded-full text-xs font-bold">
+        <span class="status-dot dot-mqtt-off" id="mqtt-dot"></span>
+        <span id="mqtt-label" class="text-yellow-400">Connecting…</span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ── Dashboard Page ── -->
+  <div id="page-home" class="relative z-10 max-w-6xl mx-auto px-6 py-12 space-y-10 fade-in">
+
+    <!-- Title -->
+    <div class="glass rounded-3xl p-12 text-center card-hover">
+      <h1 class="text-6xl md:text-7xl font-black text-white tracking-tight mb-3">Farid Villa</h1>
+      <div class="w-24 h-0.5 bg-gradient-to-r from-transparent via-white/40 to-transparent mx-auto mb-4"></div>
+      <p class="text-slate-400 text-lg font-medium">Smart Home Control Panel</p>
+    </div>
+
+    <!-- Light Controls -->
+    <div>
+      <p class="text-xs font-bold uppercase tracking-widest text-slate-500 mb-4 px-1">💡 Light Controls</p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+        <!-- Room 1 Light -->
+        <div id="light-card-room1" class="glass rounded-2xl p-8 card-hover relative overflow-hidden" style="border: 1px solid rgba(255,255,255,0.1)">
+          <div class="card-top-bar" id="light-bar-room1"></div>
+          <div class="flex items-start justify-between mb-6">
+            <div class="flex items-center gap-3">
+              <span class="status-dot dot-off" id="light-dot-room1"></span>
+              <span class="text-xs font-bold uppercase tracking-widest text-slate-400" id="light-status-room1">OFF</span>
+            </div>
+            <span class="text-3xl" id="light-icon-room1">💡</span>
+          </div>
+          <h3 class="text-2xl font-bold text-white mb-1">Room 1</h3>
+          <p class="text-slate-400 text-sm mb-6">Light Control</p>
+          <div class="flex gap-3">
+            <button onclick="controlLight('room1','ON')"
+              class="btn-on flex-1 text-white font-bold py-3 rounded-xl text-sm transition-all">
+              Turn ON
+            </button>
+            <button onclick="controlLight('room1','OFF')"
+              class="btn-off flex-1 text-white font-bold py-3 rounded-xl text-sm transition-all">
+              Turn OFF
+            </button>
+          </div>
+        </div>
+
+        <!-- Room 2 Light -->
+        <div id="light-card-room2" class="glass rounded-2xl p-8 card-hover relative overflow-hidden" style="border: 1px solid rgba(255,255,255,0.1)">
+          <div class="card-top-bar" id="light-bar-room2"></div>
+          <div class="flex items-start justify-between mb-6">
+            <div class="flex items-center gap-3">
+              <span class="status-dot dot-off" id="light-dot-room2"></span>
+              <span class="text-xs font-bold uppercase tracking-widest text-slate-400" id="light-status-room2">OFF</span>
+            </div>
+            <span class="text-3xl" id="light-icon-room2">💡</span>
+          </div>
+          <h3 class="text-2xl font-bold text-white mb-1">Room 2</h3>
+          <p class="text-slate-400 text-sm mb-6">Light Control</p>
+          <div class="flex gap-3">
+            <button onclick="controlLight('room2','ON')"
+              class="btn-on flex-1 text-white font-bold py-3 rounded-xl text-sm transition-all">
+              Turn ON
+            </button>
+            <button onclick="controlLight('room2','OFF')"
+              class="btn-off flex-1 text-white font-bold py-3 rounded-xl text-sm transition-all">
+              Turn OFF
+            </button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Motion Sensors -->
+    <div>
+      <p class="text-xs font-bold uppercase tracking-widest text-slate-500 mb-4 px-1">🔍 Motion Sensors (PIR)</p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+        <!-- Room 1 Motion -->
+        <div id="motion-card-room1" class="glass rounded-2xl p-8 card-hover relative overflow-hidden" style="border: 1px solid rgba(255,255,255,0.1)">
+          <div class="card-top-bar" id="motion-bar-room1"></div>
+          <div class="flex items-start justify-between mb-6">
+            <div class="flex items-center gap-3">
+              <span class="status-dot dot-clear" id="motion-dot-room1"></span>
+              <span class="text-xs font-bold uppercase tracking-widest text-slate-400" id="motion-status-room1">CLEAR</span>
+            </div>
+            <span class="text-3xl" id="motion-icon-room1">👁️</span>
+          </div>
+          <h3 class="text-2xl font-bold text-white mb-1">Room 1</h3>
+          <p class="text-slate-400 text-sm mb-6">PIR Motion Sensor</p>
+          <div id="motion-badge-room1"
+            class="w-full text-center py-2.5 rounded-xl text-sm font-bold border border-slate-600 text-slate-400 bg-slate-800/40">
+            No Motion
+          </div>
+        </div>
+
+        <!-- Room 2 Motion -->
+        <div id="motion-card-room2" class="glass rounded-2xl p-8 card-hover relative overflow-hidden" style="border: 1px solid rgba(255,255,255,0.1)">
+          <div class="card-top-bar" id="motion-bar-room2"></div>
+          <div class="flex items-start justify-between mb-6">
+            <div class="flex items-center gap-3">
+              <span class="status-dot dot-clear" id="motion-dot-room2"></span>
+              <span class="text-xs font-bold uppercase tracking-widest text-slate-400" id="motion-status-room2">CLEAR</span>
+            </div>
+            <span class="text-3xl" id="motion-icon-room2">👁️</span>
+          </div>
+          <h3 class="text-2xl font-bold text-white mb-1">Room 2</h3>
+          <p class="text-slate-400 text-sm mb-6">PIR Motion Sensor</p>
+          <div id="motion-badge-room2"
+            class="w-full text-center py-2.5 rounded-xl text-sm font-bold border border-slate-600 text-slate-400 bg-slate-800/40">
+            No Motion
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Last update -->
+    <p class="text-center text-slate-600 text-xs mono" id="last-update">—</p>
+  </div>
+
+  <!-- ── Activity Log Page ── -->
+  <div id="page-logs" class="hidden relative z-10 max-w-6xl mx-auto px-6 py-12 fade-in">
+    <div class="glass rounded-3xl overflow-hidden">
+      <div class="p-8 border-b border-white/10 flex items-center justify-between">
+        <div>
+          <h2 class="text-3xl font-black text-white mb-1">Activity Log</h2>
+          <p class="text-slate-400 text-sm">Motion & light events from Google Sheets</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="log-count" class="glass-dark px-4 py-2 rounded-xl text-white text-sm font-bold mono">0 records</span>
+          <button onclick="loadLogs()" class="glass-dark px-4 py-2 rounded-xl text-slate-300 text-sm font-semibold hover:text-white transition-colors">
+            <i class="fas fa-sync-alt mr-1"></i> Refresh
+          </button>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left">
+          <thead class="bg-white/5 text-slate-500 text-xs uppercase tracking-widest">
+            <tr>
+              <th class="px-8 py-5 mono">Room</th>
+              <th class="px-8 py-5 mono">Event</th>
+              <th class="px-8 py-5 mono">State</th>
+              <th class="px-8 py-5 mono">Date</th>
+              <th class="px-8 py-5 mono">Time</th>
+            </tr>
+          </thead>
+          <tbody id="logs-tbody" class="divide-y divide-white/5"></tbody>
+        </table>
+        <div id="logs-empty" class="hidden text-center py-16 text-slate-500">
+          <i class="fas fa-database text-4xl mb-4 block opacity-30"></i>
+          No activity logs yet
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── MQTT Connection ──────────────────────────────────────────
+    // Connect to the same server via WebSocket
+    const WS_URL = window.location.protocol === 'https:'
+      ? `wss://${window.location.host}`
+      : `ws://${window.location.host}`;
+
+    const clientId = 'farid_web_' + Math.random().toString(16).slice(2, 8);
+
+    const mqttClient = mqtt.connect(WS_URL, {
+      clientId,
+      clean: true,
+      reconnectPeriod: 3000,
+      connectTimeout: 10000,
+    });
+
+    mqttClient.on('connect', () => {
+      setMqttStatus(true);
+      mqttClient.subscribe('home/ui',     { qos: 0 });
+      mqttClient.subscribe('home/status', { qos: 0 });
+      // Request current state
+      mqttClient.publish('home/request_status', '{}');
+      console.log('[MQTT] Connected');
+    });
+
+    mqttClient.on('reconnect', () => setMqttStatus(false, 'Reconnecting…'));
+    mqttClient.on('offline',   () => setMqttStatus(false, 'Offline'));
+    mqttClient.on('error',     (e) => { setMqttStatus(false, 'Error'); console.error(e); });
+
+    mqttClient.on('message', (topic, payload) => {
+      try {
+        const data = JSON.parse(payload.toString());
+        console.log('[MQTT] ←', topic, data);
+
+        if (data.devices) updateAllDevices(data.devices);
+        if (data.time)    document.getElementById('last-update').textContent = 'Last update: ' + data.time;
+      } catch (e) {
+        console.error('[MQTT] Parse error:', e);
+      }
+    });
+
+    // ── UI Update Functions ──────────────────────────────────────
+
+    function updateAllDevices(devices) {
+      if (devices.room1) {
+        updateLight('room1',  devices.room1.light  || 'OFF');
+        updateMotion('room1', devices.room1.motion || 'CLEAR');
+      }
+      if (devices.room2) {
+        updateLight('room2',  devices.room2.light  || 'OFF');
+        updateMotion('room2', devices.room2.motion || 'CLEAR');
+      }
+    }
+
+    function updateLight(room, state) {
+      const isOn  = state === 'ON';
+      const card  = document.getElementById(`light-card-${room}`);
+      const bar   = document.getElementById(`light-bar-${room}`);
+      const dot   = document.getElementById(`light-dot-${room}`);
+      const label = document.getElementById(`light-status-${room}`);
+      const icon  = document.getElementById(`light-icon-${room}`);
+
+      card.classList.toggle('light-card-on', isOn);
+      bar.style.background  = isOn ? 'linear-gradient(90deg,#22c55e,#16a34a)' : 'rgba(255,255,255,0.08)';
+      dot.className         = 'status-dot ' + (isOn ? 'dot-on' : 'dot-off');
+      label.textContent     = isOn ? 'ON' : 'OFF';
+      label.className       = 'text-xs font-bold uppercase tracking-widest ' + (isOn ? 'text-green-400' : 'text-slate-400');
+      icon.textContent      = isOn ? '💡' : '🔦';
+    }
+
+    function updateMotion(room, state) {
+      const detected = state === 'DETECTED';
+      const card  = document.getElementById(`motion-card-${room}`);
+      const bar   = document.getElementById(`motion-bar-${room}`);
+      const dot   = document.getElementById(`motion-dot-${room}`);
+      const label = document.getElementById(`motion-status-${room}`);
+      const icon  = document.getElementById(`motion-icon-${room}`);
+      const badge = document.getElementById(`motion-badge-${room}`);
+
+      card.classList.toggle('motion-detected', detected);
+      bar.style.background  = detected ? 'linear-gradient(90deg,#ef4444,#dc2626)' : 'rgba(255,255,255,0.08)';
+      dot.className         = 'status-dot ' + (detected ? 'dot-detected' : 'dot-clear');
+      label.textContent     = detected ? 'DETECTED' : 'CLEAR';
+      label.className       = 'text-xs font-bold uppercase tracking-widest ' + (detected ? 'text-red-400' : 'text-slate-400');
+      icon.textContent      = detected ? '🚨' : '👁️';
+
+      if (detected) {
+        badge.textContent  = '⚠ Motion Detected!';
+        badge.className    = 'w-full text-center py-2.5 rounded-xl text-sm font-bold border border-red-500/30 text-red-300 bg-red-500/10';
+      } else {
+        badge.textContent  = 'No Motion';
+        badge.className    = 'w-full text-center py-2.5 rounded-xl text-sm font-bold border border-slate-600 text-slate-400 bg-slate-800/40';
+      }
+    }
+
+    function setMqttStatus(connected, label) {
+      const dot   = document.getElementById('mqtt-dot');
+      const lbl   = document.getElementById('mqtt-label');
+      dot.className = 'status-dot ' + (connected ? 'dot-mqtt-on' : 'dot-mqtt-off');
+      lbl.textContent  = connected ? 'Connected' : (label || 'Disconnected');
+      lbl.className    = connected ? 'text-green-400' : 'text-yellow-400';
+    }
+
+    // ── Light Control ────────────────────────────────────────────
+    async function controlLight(room, state) {
+      try {
+        const res = await fetch('/api/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ room, state }),
+        });
+        const data = await res.json();
+        if (data.success) updateLight(room, state);
+      } catch (e) {
+        console.error('Control error:', e);
+      }
+    }
+
+    // ── Activity Logs ────────────────────────────────────────────
+    async function loadLogs() {
+      try {
+        const res  = await fetch('/api/logs');
+        const data = await res.json();
+        const logs = data.logs || [];
+
+        const tbody = document.getElementById('logs-tbody');
+        const empty = document.getElementById('logs-empty');
+        const count = document.getElementById('log-count');
+
+        const rows = logs.slice(1).reverse(); // skip header row, newest first
+        count.textContent = `${rows.length} records`;
+
+        if (rows.length === 0) {
+          tbody.innerHTML = '';
+          empty.classList.remove('hidden');
+          return;
+        }
+
+        empty.classList.add('hidden');
+        tbody.innerHTML = rows.map(([room, event, state, date, time]) => {
+          const isMotion   = event === 'Motion';
+          const isDetected = state === 'DETECTED' || state === 'ON';
+          const badgeClass = isDetected
+            ? 'px-3 py-1 rounded-lg text-xs font-bold bg-red-500/15 text-red-300 border border-red-500/25'
+            : 'px-3 py-1 rounded-lg text-xs font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+          return `
+            <tr class="table-row border-white/5">
+              <td class="px-8 py-5 text-white font-semibold">${room || '—'}</td>
+              <td class="px-8 py-5 text-slate-300">${event || '—'}</td>
+              <td class="px-8 py-5"><span class="${badgeClass}">${state || '—'}</span></td>
+              <td class="px-8 py-5 text-slate-400 mono text-sm">${date || '—'}</td>
+              <td class="px-8 py-5 text-slate-500 mono text-sm">${time || '—'}</td>
+            </tr>`;
+        }).join('');
+      } catch (e) {
+        console.error('Logs error:', e);
+      }
+    }
+
+    // ── Page Navigation ──────────────────────────────────────────
+    function showPage(page) {
+      document.getElementById('page-home').classList.toggle('hidden', page !== 'home');
+      document.getElementById('page-logs').classList.toggle('hidden', page !== 'logs');
+      document.getElementById('btn-home').classList.toggle('active', page === 'home');
+      document.getElementById('btn-logs').classList.toggle('active', page === 'logs');
+      if (page === 'logs') loadLogs();
+    }
+
+    // ── Init ─────────────────────────────────────────────────────
+    // Load initial state via REST on page load
+    fetch('/api/status')
+      .then(r => r.json())
+      .then(d => { if (d.devices) updateAllDevices(d.devices); })
+      .catch(() => {});
+  </script>
+</body>
+</html>
