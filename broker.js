@@ -14,7 +14,9 @@ const WebSocket = require('ws');
 
 // Internal TCP port for ESP32 MQTT connections
 // Railway TCP proxy must point to this port
-const TCP_INTERNAL_PORT = parseInt(process.env.TCP_INTERNAL_PORT) || 1885;
+// NOTE: Railway blocks standard MQTT ports (1883, 1884, 1885)
+// Use a high port like 9001 instead
+const TCP_INTERNAL_PORT = parseInt(process.env.TCP_INTERNAL_PORT) || 9001;
 
 // ── State ─────────────────────────────────────────────────────
 const subscriptions = new Map(); // Map<client, string[]>
