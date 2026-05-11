@@ -238,14 +238,8 @@ function attachBroker(httpServer) {
   console.log('[Broker] WebSocket MQTT ready');
 
   // TCP MQTT — for ESP32 (Railway TCP proxy → this port)
-  // We use TCP_INTERNAL_PORT but if it's the same as PORT, we don't bind to avoid EADDRINUSE.
-  // Instead, index.js will multiplex raw MQTT connections directly to handleTcpClient.
-  let tcpPort = parseInt(process.env.TCP_INTERNAL_PORT) || 1885;
-
-  if (tcpPort === parseInt(process.env.PORT)) {
-    console.log(`[Broker] TCP_INTERNAL_PORT is same as PORT (${tcpPort}). Relying on multiplexer in index.js.`);
-    return;
-  }
+  // We unconditionally start the TCP broker on 1883 (or TCP_INTERNAL_PORT)
+  let tcpPort = parseInt(process.env.TCP_INTERNAL_PORT) || 1883;
 
   const tcpServer = net.createServer(handleTcpClient);
 
