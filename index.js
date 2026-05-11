@@ -1,11 +1,11 @@
 require('dotenv').config();
 const http    = require('http');
+const net     = require('net');
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
 const { google } = require('googleapis');
-const { attachBroker, backendPublish, backendSubscribe } = require('./broker');
-
+const { attachBroker, backendPublish, backendSubscribe, handleTcpClient } = require('./broker');
 // ── Config ────────────────────────────────────────────────────
 // Railway sets PORT automatically. Everything (HTTP + WS + TCP MQTT)
 // runs on this single port. No separate TCP_PORT needed.
@@ -193,13 +193,33 @@ app.get('*', (req, res) => {
 });
 
 // ── Start Server ──────────────────────────────────────────────
-const server = http.createServer(app);
+const httpServer = http.createServer(app);
+
+// Multiplexing Server to handle both raw TCP MQTT and HTTP requests on PORT
+const server = net.createServer((socket) => {
+  socket.once('data', (data) => {
+    // Pause socket while we determine the protocol
+    socket.pause();
+    socket.unshift(data);
+
+    // MQTT Connect packets start with 0x10.
+    // We check for 0x10 to route to MQTT Broker.
+    if (data[0] === 0x10) {
+      handleTcpClient(socket);
+      socket.resume();
+    } else {
+      // Otherwise assume HTTP (or WS upgrade)
+      httpServer.emit('connection', socket);
+      socket.resume();
+    }
+  });
+});
 
 server.listen(PORT, () => {
   console.log(`\n🏠  Farid Villa Smart Home`);
-  console.log(`🌐  HTTP + WebSocket on port ${PORT}`);
-  console.log(`📡  TCP MQTT broker on port ${process.env.TCP_INTERNAL_PORT || 1883}`);
-  attachBroker(server);
+  console.log(`🌐  HTTP + WebSocket multiplexed on port ${PORT}`);
+  console.log(`📡  TCP MQTT broker multiplexed on port ${PORT}`);
+  attachBroker(httpServer);
 });
 
 server.on('error', (err) => {

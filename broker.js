@@ -214,20 +214,29 @@ function attachBroker(httpServer) {
   console.log('[Broker] WebSocket MQTT ready');
 
   // TCP MQTT — for ESP32 (Railway TCP proxy → this port)
+  // We use TCP_INTERNAL_PORT but if it's the same as PORT, we don't bind to avoid EADDRINUSE.
+  // Instead, index.js will multiplex raw MQTT connections directly to handleTcpClient.
+  let tcpPort = parseInt(process.env.TCP_INTERNAL_PORT) || 1885;
+  
+  if (tcpPort === parseInt(process.env.PORT)) {
+    console.log(`[Broker] TCP_INTERNAL_PORT is same as PORT (${tcpPort}). Relying on multiplexer in index.js.`);
+    return;
+  }
+
   const tcpServer = net.createServer(handleTcpClient);
 
   tcpServer.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`[Broker] TCP port ${TCP_INTERNAL_PORT} in use — retrying in 3s`);
-      setTimeout(() => tcpServer.listen(TCP_INTERNAL_PORT, '0.0.0.0'), 3000);
+      console.error(`[Broker] TCP port ${tcpPort} in use — retrying in 3s`);
+      setTimeout(() => tcpServer.listen(tcpPort, '0.0.0.0'), 3000);
     } else {
       console.error('[Broker] TCP server error:', err.message);
     }
   });
 
-  tcpServer.listen(TCP_INTERNAL_PORT, '0.0.0.0', () => {
-    console.log(`[Broker] TCP MQTT ready on port ${TCP_INTERNAL_PORT}`);
+  tcpServer.listen(tcpPort, '0.0.0.0', () => {
+    console.log(`[Broker] TCP MQTT ready on port ${tcpPort}`);
   });
 }
 
-module.exports = { attachBroker, backendPublish, backendSubscribe };
+module.exports = { attachBroker, backendPublish, backendSubscribe, handleTcpClient };
