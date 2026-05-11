@@ -1,23 +1,24 @@
 /**
  * Farid Villa – Built-in MQTT Broker
  *
- * Runs on the SAME port as the HTTP server by detecting the protocol
- * from the first byte of each incoming TCP connection:
- *   - MQTT CONNECT starts with 0x10  → handle as MQTT
- *   - HTTP starts with GET/POST/etc  → pass to HTTP server
+ * Two transports:
+ *   1. WebSocket  — attached to the Express HTTP server (browser frontend)
+ *   2. TCP        — dedicated server on TCP_INTERNAL_PORT (ESP32 via Railway proxy)
  *
- * This means Railway only needs ONE port for everything:
- *   HTTP  → browser frontend
- *   WS    → browser MQTT (mqtt.js)
- *   TCP   → ESP32 MQTT (via Railway TCP proxy → same port)
+ * Railway TCP proxy points to TCP_INTERNAL_PORT (1883).
+ * Railway HTTP port (PORT) is separate — no conflict.
  */
 
 const net       = require('net');
 const WebSocket = require('ws');
 
-// ── Subscription store ────────────────────────────────────────
-const subscriptions = new Map(); // Map<client, string[]>
-const retained      = new Map(); // Map<topic, Buffer>
+// Internal TCP port for ESP32 MQTT connections
+// Railway TCP proxy must point to this port
+const TCP_INTERNAL_PORT = parseInt(process.env.TCP_INTERNAL_PORT) || 1883;
+
+// ── State ─────────────────────────────────────────────────────
+const subscriptions   = new Map(); // Map<client, string[]>
+const retained        = new Map(); // Map<topic, Buffer>
 const backendHandlers = new Map(); // Map<topic, fn>
 
 // ── MQTT Encoding ─────────────────────────────────────────────
@@ -44,26 +45,28 @@ function parseRemainingLength(buffer, offset) {
   return { length: value, bytes };
 }
 
-// ── MQTT Packet Builders ──────────────────────────────────────
-function buildConnack()          { return Buffer.from([0x20, 0x02, 0x00, 0x00]); }
-function buildPingresp()         { return Buffer.from([0xd0, 0x00]); }
-function buildSuback(packetId)   { return Buffer.concat([Buffer.from([0x90, 0x03]), packetId, Buffer.from([0x00])]); }
+// ── Packet Builders ───────────────────────────────────────────
+const CONNACK  = Buffer.from([0x20, 0x02, 0x00, 0x00]);
+const PINGRESP = Buffer.from([0xd0, 0x00]);
 
-function buildPublishPacket(topic, payload, retain = false) {
-  const topicBuf   = Buffer.from(topic, 'utf8');
-  const payloadBuf = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8');
-  const remainLen  = 2 + topicBuf.length + payloadBuf.length;
+function buildSuback(packetId) {
+  return Buffer.concat([Buffer.from([0x90, 0x03]), packetId, Buffer.from([0x00])]);
+}
+
+function buildPublish(topic, payload, retain = false) {
+  const t = Buffer.from(topic, 'utf8');
+  const p = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8');
+  const rl = 2 + t.length + p.length;
   return Buffer.concat([
     Buffer.from([retain ? 0x31 : 0x30]),
-    encodeRemainingLength(remainLen),
-    Buffer.from([topicBuf.length >> 8, topicBuf.length & 0xff]),
-    topicBuf,
-    payloadBuf,
+    encodeRemainingLength(rl),
+    Buffer.from([t.length >> 8, t.length & 0xff]),
+    t, p,
   ]);
 }
 
-// ── Send helpers ──────────────────────────────────────────────
-function sendPacket(client, packet) {
+// ── Send ──────────────────────────────────────────────────────
+function send(client, packet) {
   if (!client) return;
   try {
     if (typeof client.write === 'function' && !client.destroyed) {
@@ -71,107 +74,129 @@ function sendPacket(client, packet) {
     } else if (typeof client.send === 'function' && client.readyState === WebSocket.OPEN) {
       client.send(packet);
     }
-  } catch (e) { /* ignore */ }
+  } catch (_) {}
 }
 
-// ── Subscription helpers ──────────────────────────────────────
-function addSubscription(client, topic) {
+// ── Subscriptions ─────────────────────────────────────────────
+function subscribe(client, topic) {
   if (!subscriptions.has(client)) subscriptions.set(client, []);
-  const topics = subscriptions.get(client);
-  if (!topics.includes(topic)) topics.push(topic);
+  const list = subscriptions.get(client);
+  if (!list.includes(topic)) list.push(topic);
 }
 
-function cleanupClient(client) {
+function remove(client) {
   subscriptions.delete(client);
 }
 
 // ── Publish ───────────────────────────────────────────────────
-function publishToSubscribers(topic, payload, retainFlag) {
-  if (retainFlag) {
+function publish(topic, payload, retain = false) {
+  if (retain) {
     payload.length === 0 ? retained.delete(topic) : retained.set(topic, payload);
   }
-  const packet = buildPublishPacket(topic, payload);
-  for (const [client, topics] of subscriptions.entries()) {
-    if (topics.includes(topic)) sendPacket(client, packet);
+  const pkt = buildPublish(topic, payload);
+  for (const [client, topics] of subscriptions) {
+    if (topics.includes(topic)) send(client, pkt);
   }
-  console.log(`[Broker] PUBLISH ${topic} → ${payload.toString().substring(0, 80)}`);
+  console.log(`[Broker] >> ${topic}: ${payload.toString().slice(0, 80)}`);
 
-  // Dispatch to backend handlers
-  const handler = backendHandlers.get(topic);
-  if (handler) {
-    try { handler(topic, payload.toString()); } catch (e) {
-      console.error('[Broker] handler error:', e.message);
-    }
-  }
+  const h = backendHandlers.get(topic);
+  if (h) { try { h(topic, payload.toString()); } catch (e) { console.error('[Broker] handler:', e.message); } }
 }
 
 // ── MQTT Packet Parser ────────────────────────────────────────
-function handleConnect(client, buffer, offset) {
+function onConnect(client, buf, offset) {
   try {
-    const pnLen = (buffer[offset] << 8) | buffer[offset + 1];
+    const pnLen = (buf[offset] << 8) | buf[offset + 1];
     offset += 2 + pnLen + 4;
-    const cidLen = (buffer[offset] << 8) | buffer[offset + 1];
-    offset += 2;
-    const clientId = buffer.slice(offset, offset + cidLen).toString('utf8');
-    console.log(`[Broker] CONNECT clientId=${clientId}`);
-  } catch (e) {
-    console.log('[Broker] CONNECT');
-  }
-  sendPacket(client, buildConnack());
+    const cidLen = (buf[offset] << 8) | buf[offset + 1];
+    const cid = buf.slice(offset + 2, offset + 2 + cidLen).toString();
+    console.log(`[Broker] CONNECT ${cid}`);
+  } catch (_) { console.log('[Broker] CONNECT'); }
+  send(client, CONNACK);
 }
 
-function handleSubscribe(client, buffer, offset, remainingLength) {
-  const end = offset + remainingLength;
-  const packetId = buffer.slice(offset, offset + 2);
+function onSubscribe(client, buf, offset, remLen) {
+  const end = offset + remLen;
+  const pid = buf.slice(offset, offset + 2);
   offset += 2;
   while (offset < end) {
-    const topicLen = (buffer[offset] << 8) | buffer[offset + 1];
+    const tl = (buf[offset] << 8) | buf[offset + 1];
     offset += 2;
-    const topic = buffer.slice(offset, offset + topicLen).toString('utf8');
-    offset += topicLen + 1; // +1 for QoS byte
-    addSubscription(client, topic);
+    const topic = buf.slice(offset, offset + tl).toString();
+    offset += tl + 1;
+    subscribe(client, topic);
     console.log(`[Broker] SUBSCRIBE ${topic}`);
-    if (retained.has(topic)) sendPacket(client, buildPublishPacket(topic, retained.get(topic), true));
+    if (retained.has(topic)) send(client, buildPublish(topic, retained.get(topic), true));
   }
-  sendPacket(client, buildSuback(packetId));
+  send(client, buildSuback(pid));
 }
 
-function handlePublish(client, buffer, offset, remainingLength, flags) {
-  const topicLen = (buffer[offset] << 8) | buffer[offset + 1];
-  offset += 2;
-  const topic   = buffer.slice(offset, offset + topicLen).toString('utf8');
-  offset += topicLen;
-  const payload = buffer.slice(offset, offset + remainingLength - 2 - topicLen);
-  publishToSubscribers(topic, payload, (flags & 0x01) !== 0);
+function onPublish(client, buf, offset, remLen, flags) {
+  const tl    = (buf[offset] << 8) | buf[offset + 1];
+  const topic = buf.slice(offset + 2, offset + 2 + tl).toString();
+  const data  = buf.slice(offset + 2 + tl, offset + remLen);
+  publish(topic, data, (flags & 0x01) !== 0);
 }
 
-function processMQTTBuffer(client, buffer) {
+function processBuffer(client, buffer) {
   let pos = 0;
   while (pos < buffer.length) {
     if (pos + 1 >= buffer.length) break;
-    const firstByte  = buffer[pos];
-    const packetType = firstByte >> 4;
-    const flags      = firstByte & 0x0f;
-    const { length: remainLen, bytes: lenBytes } = parseRemainingLength(buffer, pos + 1);
-    const headerLen = 1 + lenBytes;
-    const totalLen  = headerLen + remainLen;
-    if (pos + totalLen > buffer.length) break;
-    const offset = pos + headerLen;
-    switch (packetType) {
-      case 1:  handleConnect(client, buffer, offset); break;
-      case 3:  handlePublish(client, buffer, offset, remainLen, flags); break;
-      case 8:  handleSubscribe(client, buffer, offset, remainLen); break;
-      case 12: sendPacket(client, buildPingresp()); break;
-      case 14: cleanupClient(client); break;
+    const b0  = buffer[pos];
+    const typ = b0 >> 4;
+    const flg = b0 & 0x0f;
+    const { length: remLen, bytes: lb } = parseRemainingLength(buffer, pos + 1);
+    const hLen  = 1 + lb;
+    const total = hLen + remLen;
+    if (pos + total > buffer.length) break;
+    const off = pos + hLen;
+    switch (typ) {
+      case 1:  onConnect(client, buffer, off); break;
+      case 3:  onPublish(client, buffer, off, remLen, flg); break;
+      case 8:  onSubscribe(client, buffer, off, remLen); break;
+      case 12: send(client, PINGRESP); break;
+      case 14: remove(client); break;
     }
-    pos += totalLen;
+    pos += total;
   }
+}
+
+// ── TCP client handler ────────────────────────────────────────
+function handleTcpClient(socket) {
+  console.log('[Broker] TCP connected:', socket.remoteAddress);
+  subscriptions.set(socket, []);
+  let buf = Buffer.alloc(0);
+
+  socket.on('data', (data) => {
+    buf = Buffer.concat([buf, data]);
+    processBuffer(socket, buf);
+    // Keep unprocessed tail
+    // (simple approach: reset — works for well-formed packets)
+    buf = Buffer.alloc(0);
+  });
+
+  socket.on('close', () => { remove(socket); console.log('[Broker] TCP disconnected'); });
+  socket.on('error', (e) => { remove(socket); console.error('[Broker] TCP error:', e.message); });
+  socket.setTimeout(120000); // 2 min keepalive timeout
+  socket.on('timeout', () => socket.destroy());
+}
+
+// ── WebSocket client handler ──────────────────────────────────
+function handleWsClient(ws) {
+  console.log('[Broker] WS connected');
+  subscriptions.set(ws, []);
+
+  ws.on('message', (data) => {
+    processBuffer(ws, Buffer.isBuffer(data) ? data : Buffer.from(data));
+  });
+  ws.on('close', () => { remove(ws); console.log('[Broker] WS disconnected'); });
+  ws.on('error', () => remove(ws));
 }
 
 // ── Public API ────────────────────────────────────────────────
 function backendPublish(topic, payload, retain = false) {
   const str = typeof payload === 'object' ? JSON.stringify(payload) : String(payload);
-  publishToSubscribers(topic, Buffer.from(str, 'utf8'), retain);
+  publish(topic, Buffer.from(str, 'utf8'), retain);
 }
 
 function backendSubscribe(topic, handler) {
@@ -179,61 +204,30 @@ function backendSubscribe(topic, handler) {
 }
 
 /**
- * attachBroker — attaches WebSocket MQTT to the HTTP server
- * AND intercepts raw TCP MQTT connections on the SAME port
- * by replacing the server's connection handler.
- *
+ * Attach broker to HTTP server (WebSocket) and start dedicated TCP server
  * @param {http.Server} httpServer
  */
 function attachBroker(httpServer) {
-  // ── WebSocket MQTT (browser) ────────────────────────────────
+  // WebSocket MQTT — for browser
   const wss = new WebSocket.Server({ server: httpServer });
-  wss.on('connection', (ws) => {
-    console.log('[Broker] WS client connected');
-    subscriptions.set(ws, []);
-    ws.on('message', (data) => {
-      processMQTTBuffer(ws, Buffer.isBuffer(data) ? data : Buffer.from(data));
-    });
-    ws.on('close', () => { cleanupClient(ws); console.log('[Broker] WS client disconnected'); });
-    ws.on('error', () => cleanupClient(ws));
-  });
-  console.log('[Broker] WebSocket MQTT broker attached');
+  wss.on('connection', handleWsClient);
+  console.log('[Broker] WebSocket MQTT ready');
 
-  // ── Raw TCP MQTT (ESP32) on the SAME port ───────────────────
-  // We intercept the raw 'connection' event BEFORE Node's HTTP parser
-  // by peeking at the first byte. MQTT CONNECT = 0x10, HTTP = ASCII letter.
-  const originalEmit = httpServer.emit.bind(httpServer);
+  // TCP MQTT — for ESP32 (Railway TCP proxy → this port)
+  const tcpServer = net.createServer(handleTcpClient);
 
-  httpServer.on('connection', (socket) => {
-    socket.once('data', (firstChunk) => {
-      const firstByte = firstChunk[0];
-
-      // MQTT CONNECT packet type = 1 → first byte = 0x10
-      if (firstByte === 0x10) {
-        // Raw MQTT TCP connection (ESP32)
-        console.log('[Broker] TCP MQTT client connected:', socket.remoteAddress);
-        subscriptions.set(socket, []);
-
-        let buf = firstChunk; // process the first chunk immediately
-        processMQTTBuffer(socket, buf);
-        buf = Buffer.alloc(0);
-
-        socket.on('data', (data) => {
-          buf = Buffer.concat([buf, data]);
-          processMQTTBuffer(socket, buf);
-          buf = Buffer.alloc(0);
-        });
-        socket.on('close', () => { cleanupClient(socket); console.log('[Broker] TCP MQTT client disconnected'); });
-        socket.on('error', () => cleanupClient(socket));
-      } else {
-        // HTTP / WebSocket upgrade — put the data back and let Node handle it
-        socket.unshift(firstChunk);
-        // Nothing else needed — the HTTP server already has this socket
-      }
-    });
+  tcpServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[Broker] TCP port ${TCP_INTERNAL_PORT} in use — retrying in 3s`);
+      setTimeout(() => tcpServer.listen(TCP_INTERNAL_PORT, '0.0.0.0'), 3000);
+    } else {
+      console.error('[Broker] TCP server error:', err.message);
+    }
   });
 
-  console.log('[Broker] TCP MQTT detection active on HTTP port');
+  tcpServer.listen(TCP_INTERNAL_PORT, '0.0.0.0', () => {
+    console.log(`[Broker] TCP MQTT ready on port ${TCP_INTERNAL_PORT}`);
+  });
 }
 
 module.exports = { attachBroker, backendPublish, backendSubscribe };
