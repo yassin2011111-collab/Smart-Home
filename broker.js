@@ -166,23 +166,36 @@ function handleTcpClient(socket) {
   console.log('[Broker] TCP connected:', socket.remoteAddress);
   subscriptions.set(socket, []);
   let buf = Buffer.alloc(0);
+  let proxyStripped = false;
+  let isProxy = false;
 
   socket.on('data', (data) => {
-    // Railway TCP proxy might prepend a PROXY protocol header (v1)
-    if (buf.length === 0 && data.length >= 5 && data.slice(0, 5).toString() === 'PROXY') {
-      const headerEnd = data.indexOf('\r\n');
-      if (headerEnd !== -1) {
-        console.log(`[Broker] Stripped PROXY header`);
-        data = data.slice(headerEnd + 2);
+    buf = Buffer.concat([buf, data]);
+
+    if (!proxyStripped) {
+      if (!isProxy && buf.length >= 5 && buf.slice(0, 5).toString() === 'PROXY') {
+        isProxy = true;
+      }
+
+      if (isProxy) {
+        const headerEnd = buf.indexOf('\r\n');
+        if (headerEnd !== -1) {
+          console.log(`[Broker] Stripped PROXY header`);
+          buf = buf.slice(headerEnd + 2);
+          proxyStripped = true;
+        } else {
+          // Wait for more data to complete PROXY header
+          return;
+        }
+      } else {
+        // Not a proxy header, just proceed
+        proxyStripped = true;
       }
     }
 
-    if (data.length === 0) return;
+    if (buf.length === 0) return;
 
-    buf = Buffer.concat([buf, data]);
     processBuffer(socket, buf);
-    // Keep unprocessed tail
-    // (simple approach: reset — works for well-formed packets)
     buf = Buffer.alloc(0);
   });
 
