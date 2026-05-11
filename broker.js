@@ -9,7 +9,7 @@
  * Railway HTTP port (PORT) is separate — no conflict.
  */
 
-const net       = require('net');
+const net = require('net');
 const WebSocket = require('ws');
 
 // Internal TCP port for ESP32 MQTT connections
@@ -17,8 +17,8 @@ const WebSocket = require('ws');
 const TCP_INTERNAL_PORT = parseInt(process.env.TCP_INTERNAL_PORT) || 1885;
 
 // ── State ─────────────────────────────────────────────────────
-const subscriptions   = new Map(); // Map<client, string[]>
-const retained        = new Map(); // Map<topic, Buffer>
+const subscriptions = new Map(); // Map<client, string[]>
+const retained = new Map(); // Map<topic, Buffer>
 const backendHandlers = new Map(); // Map<topic, fn>
 
 // ── MQTT Encoding ─────────────────────────────────────────────
@@ -46,7 +46,7 @@ function parseRemainingLength(buffer, offset) {
 }
 
 // ── Packet Builders ───────────────────────────────────────────
-const CONNACK  = Buffer.from([0x20, 0x02, 0x00, 0x00]);
+const CONNACK = Buffer.from([0x20, 0x02, 0x00, 0x00]);
 const PINGRESP = Buffer.from([0xd0, 0x00]);
 
 function buildSuback(packetId) {
@@ -74,7 +74,7 @@ function send(client, packet) {
     } else if (typeof client.send === 'function' && client.readyState === WebSocket.OPEN) {
       client.send(packet);
     }
-  } catch (_) {}
+  } catch (_) { }
 }
 
 // ── Subscriptions ─────────────────────────────────────────────
@@ -132,9 +132,9 @@ function onSubscribe(client, buf, offset, remLen) {
 }
 
 function onPublish(client, buf, offset, remLen, flags) {
-  const tl    = (buf[offset] << 8) | buf[offset + 1];
+  const tl = (buf[offset] << 8) | buf[offset + 1];
   const topic = buf.slice(offset + 2, offset + 2 + tl).toString();
-  const data  = buf.slice(offset + 2 + tl, offset + remLen);
+  const data = buf.slice(offset + 2 + tl, offset + remLen);
   publish(topic, data, (flags & 0x01) !== 0);
 }
 
@@ -142,18 +142,18 @@ function processBuffer(client, buffer) {
   let pos = 0;
   while (pos < buffer.length) {
     if (pos + 1 >= buffer.length) break;
-    const b0  = buffer[pos];
+    const b0 = buffer[pos];
     const typ = b0 >> 4;
     const flg = b0 & 0x0f;
     const { length: remLen, bytes: lb } = parseRemainingLength(buffer, pos + 1);
-    const hLen  = 1 + lb;
+    const hLen = 1 + lb;
     const total = hLen + remLen;
     if (pos + total > buffer.length) break;
     const off = pos + hLen;
     switch (typ) {
-      case 1:  onConnect(client, buffer, off); break;
-      case 3:  onPublish(client, buffer, off, remLen, flg); break;
-      case 8:  onSubscribe(client, buffer, off, remLen); break;
+      case 1: onConnect(client, buffer, off); break;
+      case 3: onPublish(client, buffer, off, remLen, flg); break;
+      case 8: onSubscribe(client, buffer, off, remLen); break;
       case 12: send(client, PINGRESP); break;
       case 14: remove(client); break;
     }
@@ -168,6 +168,17 @@ function handleTcpClient(socket) {
   let buf = Buffer.alloc(0);
 
   socket.on('data', (data) => {
+    // Railway TCP proxy might prepend a PROXY protocol header (v1)
+    if (buf.length === 0 && data.length >= 5 && data.slice(0, 5).toString() === 'PROXY') {
+      const headerEnd = data.indexOf('\r\n');
+      if (headerEnd !== -1) {
+        console.log(`[Broker] Stripped PROXY header`);
+        data = data.slice(headerEnd + 2);
+      }
+    }
+
+    if (data.length === 0) return;
+
     buf = Buffer.concat([buf, data]);
     processBuffer(socket, buf);
     // Keep unprocessed tail
@@ -217,7 +228,7 @@ function attachBroker(httpServer) {
   // We use TCP_INTERNAL_PORT but if it's the same as PORT, we don't bind to avoid EADDRINUSE.
   // Instead, index.js will multiplex raw MQTT connections directly to handleTcpClient.
   let tcpPort = parseInt(process.env.TCP_INTERNAL_PORT) || 1885;
-  
+
   if (tcpPort === parseInt(process.env.PORT)) {
     console.log(`[Broker] TCP_INTERNAL_PORT is same as PORT (${tcpPort}). Relying on multiplexer in index.js.`);
     return;
