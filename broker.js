@@ -3,20 +3,15 @@
  *
  * Two transports:
  *   1. WebSocket  — attached to the Express HTTP server (browser frontend)
- *   2. TCP        — dedicated server on TCP_INTERNAL_PORT (ESP32 via Railway proxy)
+ *   2. TCP        — routed from the single-port protocol-detection mux in index.js
  *
- * Railway TCP proxy points to TCP_INTERNAL_PORT (1883).
- * Railway HTTP port (PORT) is separate — no conflict.
+ * Railway only exposes one port (PORT). The net.Server mux in index.js detects
+ * whether an incoming connection is HTTP or raw MQTT TCP and routes accordingly.
+ * No separate TCP server or Railway TCP proxy is needed.
  */
 
-const net = require('net');
 const WebSocket = require('ws');
 
-// Internal TCP port for ESP32 MQTT connections
-// Railway TCP proxy must point to this port
-// NOTE: Railway blocks standard MQTT ports (1883, 1884, 1885)
-// Use a high port like 9001 instead
-const TCP_INTERNAL_PORT = parseInt(process.env.TCP_INTERNAL_PORT) || 9001;
 
 // ── State ─────────────────────────────────────────────────────
 const subscriptions = new Map(); // Map<client, string[]>
@@ -231,33 +226,15 @@ function backendSubscribe(topic, handler) {
 }
 
 /**
- * Attach broker to HTTP server (WebSocket) and start dedicated TCP server
+ * Attach broker WebSocket transport to an existing HTTP server.
+ * TCP MQTT connections are handled separately by the protocol-detection
+ * mux in index.js, which calls handleTcpClient directly.
  * @param {http.Server} httpServer
  */
 function attachBroker(httpServer) {
-  // WebSocket MQTT — for browser
   const wss = new WebSocket.Server({ server: httpServer });
   wss.on('connection', handleWsClient);
   console.log('[Broker] WebSocket MQTT ready');
-
-  // TCP MQTT — for ESP32 (Railway TCP proxy → this port)
-  // We unconditionally start the TCP broker on 1883 (or TCP_INTERNAL_PORT)
-  let tcpPort = parseInt(process.env.TCP_INTERNAL_PORT) || 1883;
-
-  const tcpServer = net.createServer(handleTcpClient);
-
-  tcpServer.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`[Broker] TCP port ${tcpPort} in use — retrying in 3s`);
-      setTimeout(() => tcpServer.listen(tcpPort, '0.0.0.0'), 3000);
-    } else {
-      console.error('[Broker] TCP server error:', err.message);
-    }
-  });
-
-  tcpServer.listen(tcpPort, '0.0.0.0', () => {
-    console.log(`[Broker] TCP MQTT ready on port ${tcpPort}`);
-  });
 }
 
 module.exports = { attachBroker, backendPublish, backendSubscribe, handleTcpClient };
