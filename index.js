@@ -6,11 +6,13 @@ const cors = require('cors');
 const path = require('path');
 const { google } = require('googleapis');
 const { attachBroker, backendPublish, backendSubscribe, handleTcpClient } = require('./broker');
+
 // ── Config ────────────────────────────────────────────────────
-// Railway sets PORT automatically. Everything (HTTP + WS + TCP MQTT)
-// runs on this single port. No separate TCP_PORT needed.
-const PORT = process.env.PORT || 3000;
-const SHEET_ID = process.env.SHEET_ID;
+// Railway exposes exactly one port. The net.Server mux below listens on it
+// and routes connections to either the HTTP server or the MQTT TCP handler.
+const PORT          = parseInt(process.env.PORT) || 3000;
+const HTTP_INTERNAL = 3001; // Express listens here; never exposed externally
+const SHEET_ID      = process.env.SHEET_ID;
 
 // ── Express App ───────────────────────────────────────────────
 const app = express();
@@ -18,14 +20,11 @@ const app = express();
 process.on('uncaughtException', (err) => {
   console.error('[System] Uncaught Exception:', err);
 });
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('[System] Unhandled Rejection:', reason);
 });
 
-app.use(cors({
-  origin: '*',
-  credentials: true,
-}));
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
 // Serve frontend (index.html) as static
@@ -87,22 +86,14 @@ async function getLogsFromSheet() {
 
 // ── MQTT Message Handlers (ESP32 → Broker → Backend) ─────────
 
-// ESP32 publishes motion events
 backendSubscribe('home/room1/motion', async (topic, payload) => {
-  const state = payload.trim(); // 'DETECTED' or 'CLEAR'
+  const state = payload.trim();
   deviceState.room1.motion = state;
   console.log(`[Backend] Room1 motion: ${state}`);
-
-  // Forward to frontend
   backendPublish('home/ui', JSON.stringify({
-    room: 'room1',
-    event: 'motion',
-    state,
-    devices: deviceState,
+    room: 'room1', event: 'motion', state, devices: deviceState,
     time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }),
   }));
-
-  // Log to Google Sheets
   await logToSheet('Room 1', 'Motion', state);
 });
 
@@ -110,19 +101,13 @@ backendSubscribe('home/room2/motion', async (topic, payload) => {
   const state = payload.trim();
   deviceState.room2.motion = state;
   console.log(`[Backend] Room2 motion: ${state}`);
-
   backendPublish('home/ui', JSON.stringify({
-    room: 'room2',
-    event: 'motion',
-    state,
-    devices: deviceState,
+    room: 'room2', event: 'motion', state, devices: deviceState,
     time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }),
   }));
-
   await logToSheet('Room 2', 'Motion', state);
 });
 
-// ESP32 publishes light state changes (when PIR auto-controls LED)
 backendSubscribe('home/room1/light/state', (topic, payload) => {
   deviceState.room1.light = payload.trim();
   backendPublish('home/ui', JSON.stringify({ devices: deviceState }));
@@ -133,20 +118,16 @@ backendSubscribe('home/room2/light/state', (topic, payload) => {
   backendPublish('home/ui', JSON.stringify({ devices: deviceState }));
 });
 
-// Frontend requests current status
-backendSubscribe('home/request_status', (topic, payload) => {
+backendSubscribe('home/request_status', () => {
   backendPublish('home/status', JSON.stringify({ devices: deviceState }), true);
 });
 
 // ── REST API ──────────────────────────────────────────────────
 
-// GET /api/status — current device state
 app.get('/api/status', (req, res) => {
   res.json({ success: true, devices: deviceState });
 });
 
-// POST /api/control — control a light from frontend
-// Body: { room: 'room1', state: 'ON' }
 app.post('/api/control', async (req, res) => {
   const { room, state } = req.body;
   if (!['room1', 'room2'].includes(room)) {
@@ -156,30 +137,16 @@ app.post('/api/control', async (req, res) => {
   if (!['ON', 'OFF'].includes(s)) {
     return res.status(400).json({ success: false, message: 'State must be ON or OFF' });
   }
-
-  // Publish to broker → ESP32 receives it
-  const topic = `home/${room}/light`;
-  backendPublish(topic, s, true);
-
-  // Update in-memory state
+  backendPublish(`home/${room}/light`, s, true);
   deviceState[room].light = s;
-
-  // Notify frontend
   backendPublish('home/ui', JSON.stringify({
-    room,
-    event: 'light',
-    state: s,
-    devices: deviceState,
+    room, event: 'light', state: s, devices: deviceState,
     time: new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' }),
   }));
-
-  // Log to Google Sheets
   await logToSheet(room === 'room1' ? 'Room 1' : 'Room 2', 'Light', s);
-
   res.json({ success: true, room, state: s });
 });
 
-// GET /api/logs — activity history from Google Sheets
 app.get('/api/logs', async (req, res) => {
   try {
     const logs = await getLogsFromSheet();
@@ -189,26 +156,102 @@ app.get('/api/logs', async (req, res) => {
   }
 });
 
-// Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', project: 'Farid Villa Smart Home', devices: deviceState });
 });
 
-// Serve frontend for all other routes
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ── Start Server ──────────────────────────────────────────────
+// ── HTTP Server (internal) ────────────────────────────────────
+// Listens on HTTP_INTERNAL (3001) — only reachable from the mux below.
 const httpServer = http.createServer(app);
 
-httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🏠  Farid Villa Smart Home`);
-  console.log(`🌐  HTTP + WebSocket server running on port ${PORT}`);
-  attachBroker(httpServer);
+httpServer.listen(HTTP_INTERNAL, '127.0.0.1', () => {
+  console.log(`[HTTP] Internal server ready on 127.0.0.1:${HTTP_INTERNAL}`);
+  attachBroker(httpServer); // WebSocket MQTT on the same HTTP server
 });
 
 httpServer.on('error', (err) => {
-  console.error(`[Server] Error: ${err.message}`);
+  console.error(`[HTTP] Server error: ${err.message}`);
   process.exit(1);
+});
+
+// ── Protocol-Detection Multiplexer ───────────────────────────
+//
+// Listens on the single Railway PORT. Peeks at the first byte of every
+// incoming TCP connection to decide whether it is HTTP or raw MQTT:
+//
+//   HTTP  — first byte is an ASCII letter (method: GET, POST, PUT, …)
+//   MQTT  — first byte is an MQTT control-packet type byte (0x10–0x3F)
+//           0x10 = CONNECT, 0x20 = CONNACK, 0x30 = PUBLISH, etc.
+//
+// The buffered byte is prepended back to the stream so neither handler
+// sees a truncated payload.
+
+// HTTP method first bytes (ASCII codes of G, P, D, H, O, C, T)
+const HTTP_FIRST_BYTES = new Set([
+  0x47, // G  — GET
+  0x50, // P  — POST, PUT, PATCH
+  0x44, // D  — DELETE
+  0x48, // H  — HEAD
+  0x4f, // O  — OPTIONS
+  0x43, // C  — CONNECT
+  0x54, // T  — TRACE
+]);
+
+const muxServer = net.createServer((socket) => {
+  socket.once('error', (err) => {
+    console.error('[Mux] Socket error before routing:', err.message);
+    socket.destroy();
+  });
+
+  // Wait for the first chunk — we only need the very first byte.
+  socket.once('data', (firstChunk) => {
+    const firstByte = firstChunk[0];
+    const isHttp = HTTP_FIRST_BYTES.has(firstByte);
+
+    if (isHttp) {
+      // ── Route to Express HTTP server ──────────────────────
+      const target = net.createConnection({ host: '127.0.0.1', port: HTTP_INTERNAL }, () => {
+        // Replay the buffered first chunk so Express sees the full request.
+        target.write(firstChunk);
+        socket.pipe(target);
+        target.pipe(socket);
+      });
+
+      target.on('error', (err) => {
+        console.error('[Mux] HTTP target error:', err.message);
+        socket.destroy();
+      });
+
+      socket.on('error', () => target.destroy());
+      socket.on('close', () => target.destroy());
+      target.on('close', () => socket.destroy());
+
+    } else {
+      // ── Route to MQTT broker (TCP handler) ────────────────
+      // Pause the socket so handleTcpClient can attach its own 'data'
+      // listener before we replay the buffered chunk.
+      socket.pause();
+      handleTcpClient(socket);
+
+      // Replay the first chunk into the socket's read buffer so the
+      // broker's 'data' handler receives it intact.
+      socket.emit('data', firstChunk);
+      socket.resume();
+    }
+  });
+});
+
+muxServer.on('error', (err) => {
+  console.error(`[Mux] Server error: ${err.message}`);
+  process.exit(1);
+});
+
+muxServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🏠  Farid Villa Smart Home`);
+  console.log(`🌐  Mux server listening on port ${PORT} (HTTP + MQTT)`);
+  console.log(`📡  HTTP → 127.0.0.1:${HTTP_INTERNAL} | MQTT TCP → broker`);
 });
