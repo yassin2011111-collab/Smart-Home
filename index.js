@@ -202,7 +202,7 @@ app.get('*', (req, res) => {
 // ── Start Server ──────────────────────────────────────────────
 const httpServer = http.createServer(app);
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏠  Farid Villa Smart Home`);
   console.log(`🌐  HTTP + WebSocket server running on port ${PORT}`);
   attachBroker(httpServer);
