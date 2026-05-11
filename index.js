@@ -197,21 +197,54 @@ const httpServer = http.createServer(app);
 
 // Multiplexing Server to handle both raw TCP MQTT and HTTP requests on PORT
 const server = net.createServer((socket) => {
+  console.log(`[Multiplexer] Connection from ${socket.remoteAddress}`);
   socket.once('data', (data) => {
-    // Pause socket while we determine the protocol
+    console.log(`[Multiplexer] Data received. First byte: 0x${data[0].toString(16)}, Length: ${data.length}`);
+    
     socket.pause();
+
+    // Railway TCP proxy might prepend a PROXY protocol header (v1)
+    // Format: "PROXY TCP4 <src> <dst> <sport> <dport>\r\n"
+    if (data.length >= 5 && data.slice(0, 5).toString() === 'PROXY') {
+      const headerEnd = data.indexOf('\r\n');
+      if (headerEnd !== -1) {
+        console.log(`[Multiplexer] Stripped PROXY header`);
+        data = data.slice(headerEnd + 2); // Strip the header
+      }
+    }
+
+    if (data.length === 0) {
+      // In rare cases, the chunk was ONLY the proxy header.
+      // We need to wait for the next chunk to decide.
+      socket.once('data', (nextData) => {
+        socket.pause();
+        routeData(socket, nextData);
+      });
+      socket.resume();
+      return;
+    }
+
+    routeData(socket, data);
+  });
+  
+  function routeData(socket, data) {
     socket.unshift(data);
 
     // MQTT Connect packets start with 0x10.
-    // We check for 0x10 to route to MQTT Broker.
     if (data[0] === 0x10) {
+      console.log(`[Multiplexer] Routing to MQTT Broker`);
       handleTcpClient(socket);
       socket.resume();
     } else {
       // Otherwise assume HTTP (or WS upgrade)
+      console.log(`[Multiplexer] Routing to HTTP Server`);
       httpServer.emit('connection', socket);
       socket.resume();
     }
+  }
+
+  socket.on('error', (err) => {
+    console.log(`[Multiplexer] Socket error: ${err.message}`);
   });
 });
 
