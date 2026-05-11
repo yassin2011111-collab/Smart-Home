@@ -1,19 +1,26 @@
 require('dotenv').config();
-const http    = require('http');
-const net     = require('net');
+const http = require('http');
+const net = require('net');
 const express = require('express');
-const cors    = require('cors');
-const path    = require('path');
+const cors = require('cors');
+const path = require('path');
 const { google } = require('googleapis');
 const { attachBroker, backendPublish, backendSubscribe, handleTcpClient } = require('./broker');
 // ── Config ────────────────────────────────────────────────────
 // Railway sets PORT automatically. Everything (HTTP + WS + TCP MQTT)
 // runs on this single port. No separate TCP_PORT needed.
-const PORT     = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 const SHEET_ID = process.env.SHEET_ID;
 
 // ── Express App ───────────────────────────────────────────────
 const app = express();
+
+process.on('uncaughtException', (err) => {
+  console.error('[System] Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[System] Unhandled Rejection:', reason);
+});
 
 app.use(cors({
   origin: '*',
@@ -45,11 +52,11 @@ function getGoogleAuth() {
 async function logToSheet(room, event, state) {
   if (!SHEET_ID || !process.env.GOOGLE_SERVICE_ACCOUNT) return;
   try {
-    const auth   = getGoogleAuth();
+    const auth = getGoogleAuth();
     const sheets = google.sheets({ version: 'v4', auth });
-    const now    = new Date();
-    const date   = now.toLocaleDateString('en-GB',  { timeZone: 'Africa/Cairo' });
-    const time   = now.toLocaleTimeString('en-GB',  { timeZone: 'Africa/Cairo' });
+    const now = new Date();
+    const date = now.toLocaleDateString('en-GB', { timeZone: 'Africa/Cairo' });
+    const time = now.toLocaleTimeString('en-GB', { timeZone: 'Africa/Cairo' });
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Sheet1!A:E',
@@ -65,9 +72,9 @@ async function logToSheet(room, event, state) {
 async function getLogsFromSheet() {
   if (!SHEET_ID || !process.env.GOOGLE_SERVICE_ACCOUNT) return [];
   try {
-    const auth   = getGoogleAuth();
+    const auth = getGoogleAuth();
     const sheets = google.sheets({ version: 'v4', auth });
-    const res    = await sheets.spreadsheets.values.get({
+    const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: 'Sheet1!A:E',
     });
@@ -200,7 +207,7 @@ const server = net.createServer((socket) => {
   console.log(`[Multiplexer] Connection from ${socket.remoteAddress}`);
   socket.once('data', (data) => {
     console.log(`[Multiplexer] Data received. First byte: 0x${data[0].toString(16)}, Length: ${data.length}`);
-    
+
     socket.pause();
 
     // Railway TCP proxy might prepend a PROXY protocol header (v1)
@@ -226,7 +233,7 @@ const server = net.createServer((socket) => {
 
     routeData(socket, data);
   });
-  
+
   function routeData(socket, data) {
     socket.unshift(data);
 
@@ -238,6 +245,7 @@ const server = net.createServer((socket) => {
     } else {
       // Otherwise assume HTTP (or WS upgrade)
       console.log(`[Multiplexer] Routing to HTTP Server`);
+      socket.server = httpServer;
       httpServer.emit('connection', socket);
       socket.resume();
     }
