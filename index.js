@@ -197,8 +197,8 @@ const server = http.createServer(app);
 
 server.listen(PORT, () => {
   console.log(`\n🏠  Farid Villa Smart Home`);
-  console.log(`🌐  HTTP + WebSocket + TCP MQTT all on port ${PORT}`);
-  console.log(`📡  Attaching MQTT broker...`);
+  console.log(`🌐  HTTP + WebSocket on port ${PORT}`);
+  console.log(`📡  TCP MQTT broker on port ${process.env.TCP_INTERNAL_PORT || 1883}`);
   attachBroker(server);
 });
 
