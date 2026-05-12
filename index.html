@@ -232,11 +232,10 @@
             </div>
             <form id="login-form" onsubmit="handleLogin(event)" class="space-y-5">
                 <div>
-                    <label
-                        class="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Username</label>
-                    <input type="text" id="username" required
+                    <label class="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Email</label>
+                    <input type="email" id="email" required
                         class="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                        placeholder="Enter your username" />
+                        placeholder="admin@farid.villa" />
                 </div>
                 <div>
                     <label
@@ -248,7 +247,7 @@
                 <div id="login-error" class="hidden text-red-400 text-sm font-semibold text-center mt-2">Invalid
                     credentials
                 </div>
-                <button type="submit"
+                <button type="submit" id="login-btn"
                     class="w-full bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white font-bold py-3.5 rounded-xl transition-all shadow-lg shadow-blue-500/25 mt-4">
                     Sign In
                 </button>
@@ -277,9 +276,15 @@
                 </button>
             </div>
 
-            <div id="mqtt-pill" class="flex items-center gap-2 glass-dark px-4 py-2 rounded-full text-xs font-bold">
-                <span class="status-dot dot-mqtt-off" id="mqtt-dot"></span>
-                <span id="mqtt-label" class="text-yellow-400">Connecting…</span>
+            <div class="flex items-center gap-4">
+                <div id="mqtt-pill" class="flex items-center gap-2 glass-dark px-4 py-2 rounded-full text-xs font-bold">
+                    <span class="status-dot dot-mqtt-off" id="mqtt-dot"></span>
+                    <span id="mqtt-label" class="text-yellow-400">Connecting…</span>
+                </div>
+                <button onclick="handleLogout()"
+                    class="text-slate-400 hover:text-white transition-colors text-sm font-bold">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </button>
             </div>
         </div>
     </nav>
@@ -445,23 +450,70 @@
     </div>
 
     <script>
-        // ── Login Handling ───────────────────────────────────────────
-        function handleLogin(e) {
+        // ── Auth Handling ───────────────────────────────────────────
+        let TOKEN = localStorage.getItem('farid_token');
+
+        async function handleLogin(e) {
             e.preventDefault();
-            const u = document.getElementById('username').value.trim();
-            const p = document.getElementById('password').value.trim();
+            const email = document.getElementById('email').value.trim();
+            const password = document.getElementById('password').value.trim();
+            const btn = document.getElementById('login-btn');
+            const error = document.getElementById('login-error');
 
-            // Simple validation (can be anything for this demo)
-            if (u.length > 0 && p.length > 0) {
-                document.getElementById('page-login').classList.add('hidden');
-                document.getElementById('main-nav').classList.remove('hidden');
-                document.getElementById('page-home').classList.remove('hidden');
+            btn.disabled = true;
+            btn.textContent = 'Authenticating...';
+            error.classList.add('hidden');
 
-                // Initialize connections only after login
-                initApp();
-            } else {
-                document.getElementById('login-error').classList.remove('hidden');
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    TOKEN = data.token;
+                    localStorage.setItem('farid_token', TOKEN);
+                    showDashboard();
+                } else {
+                    error.textContent = data.message || 'Invalid credentials';
+                    error.classList.remove('hidden');
+                }
+            } catch (err) {
+                error.textContent = 'Server connection failed';
+                error.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Sign In';
             }
+        }
+
+        function handleLogout() {
+            localStorage.removeItem('farid_token');
+            TOKEN = null;
+            location.reload();
+        }
+
+        function showDashboard() {
+            document.getElementById('page-login').classList.add('hidden');
+            document.getElementById('main-nav').classList.remove('hidden');
+            document.getElementById('page-home').classList.remove('hidden');
+            initApp();
+        }
+
+        // ── API Fetch with Auth ──────────────────────────────────────
+        async function apiFetch(url, options = {}) {
+            options.headers = {
+                ...options.headers,
+                'Authorization': `Bearer ${TOKEN}`
+            };
+            const res = await fetch(url, options);
+            if (res.status === 401) {
+                handleLogout();
+                throw new Error('Unauthorized');
+            }
+            return res.json();
         }
 
         // ── MQTT Connection ──────────────────────────────────────────
@@ -471,11 +523,10 @@
             // 1. Fetch HiveMQ Credentials from backend
             let mqttConfig;
             try {
-                const res = await fetch('/api/mqtt-config');
-                mqttConfig = await res.json();
+                mqttConfig = await apiFetch('/api/mqtt-config');
             } catch (err) {
                 console.error('Failed to fetch MQTT config', err);
-                setMqttStatus(false, 'Config Error');
+                setMqttStatus(false, 'Auth Error');
                 return;
             }
 
@@ -484,7 +535,7 @@
             const clientId = 'farid_web_' + Math.random().toString(16).slice(2, 8);
 
             console.log('Connecting to HiveMQ Cloud...');
-            const mqttClient = mqtt.connect(WS_URL, {
+            mqttClient = mqtt.connect(WS_URL, {
                 clientId,
                 username: mqttConfig.username,
                 password: mqttConfig.password,
@@ -518,111 +569,116 @@
                 }
             });
 
-            // ── UI Update Functions ──────────────────────────────────────
+            // Initial state load
+            try {
+                const d = await apiFetch('/api/status');
+                if (d.devices) updateAllDevices(d.devices);
+            } catch (e) { }
+        }
 
-            function updateAllDevices(devices) {
-                if (devices.room1) {
-                    updateLight('room1', devices.room1.light || 'OFF');
-                    updateMotion('room1', devices.room1.motion || 'CLEAR');
+        // ── UI Update Functions ──────────────────────────────────────
+
+        function updateAllDevices(devices) {
+            if (devices.room1) {
+                updateLight('room1', devices.room1.light || 'OFF');
+                updateMotion('room1', devices.room1.motion || 'CLEAR');
+            }
+            if (devices.room2) {
+                updateLight('room2', devices.room2.light || 'OFF');
+                updateMotion('room2', devices.room2.motion || 'CLEAR');
+            }
+        }
+
+        function updateLight(room, state) {
+            const isOn = state === 'ON';
+            const card = document.getElementById(`light-card-${room}`);
+            const bar = document.getElementById(`light-bar-${room}`);
+            const dot = document.getElementById(`light-dot-${room}`);
+            const label = document.getElementById(`light-status-${room}`);
+            const icon = document.getElementById(`light-icon-${room}`);
+
+            card.classList.toggle('light-card-on', isOn);
+            bar.style.background = isOn ? 'linear-gradient(90deg,#22c55e,#16a34a)' : 'rgba(255,255,255,0.08)';
+            dot.className = 'status-dot ' + (isOn ? 'dot-on' : 'dot-off');
+            label.textContent = isOn ? 'ON' : 'OFF';
+            label.className = 'text-xs font-bold uppercase tracking-widest ' + (isOn ? 'text-green-400' : 'text-slate-400');
+            icon.textContent = isOn ? '💡' : '🔦';
+        }
+
+        function updateMotion(room, state) {
+            const detected = state === 'DETECTED';
+            const card = document.getElementById(`motion-card-${room}`);
+            const bar = document.getElementById(`motion-bar-${room}`);
+            const dot = document.getElementById(`motion-dot-${room}`);
+            const label = document.getElementById(`motion-status-${room}`);
+            const icon = document.getElementById(`motion-icon-${room}`);
+            const badge = document.getElementById(`motion-badge-${room}`);
+
+            card.classList.toggle('motion-detected', detected);
+            bar.style.background = detected ? 'linear-gradient(90deg,#ef4444,#dc2626)' : 'rgba(255,255,255,0.08)';
+            dot.className = 'status-dot ' + (detected ? 'dot-detected' : 'dot-clear');
+            label.textContent = detected ? 'DETECTED' : 'CLEAR';
+            label.className = 'text-xs font-bold uppercase tracking-widest ' + (detected ? 'text-red-400' : 'text-slate-400');
+            icon.textContent = detected ? '🚨' : '👁️';
+
+            if (detected) {
+                badge.textContent = '⚠ Motion Detected!';
+                badge.className = 'w-full text-center py-2.5 rounded-xl text-sm font-bold border border-red-500/30 text-red-300 bg-red-500/10';
+            } else {
+                badge.textContent = 'No Motion';
+                badge.className = 'w-full text-center py-2.5 rounded-xl text-sm font-bold border border-slate-600 text-slate-400 bg-slate-800/40';
+            }
+        }
+
+        function setMqttStatus(connected, label) {
+            const dot = document.getElementById('mqtt-dot');
+            const lbl = document.getElementById('mqtt-label');
+            if (!dot || !lbl) return;
+            dot.className = 'status-dot ' + (connected ? 'dot-mqtt-on' : 'dot-mqtt-off');
+            lbl.textContent = connected ? 'Connected' : (label || 'Disconnected');
+            lbl.className = connected ? 'text-green-400' : 'text-yellow-400';
+        }
+
+        // ── Light Control ────────────────────────────────────────────
+        async function controlLight(room, state) {
+            try {
+                const data = await apiFetch('/api/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ room, state }),
+                });
+                if (data.success) updateLight(room, state);
+            } catch (e) {
+                console.error('Control error:', e);
+            }
+        }
+
+        // ── Activity Logs ────────────────────────────────────────────
+        async function loadLogs() {
+            try {
+                const data = await apiFetch('/api/logs');
+                const logs = data.logs || [];
+
+                const tbody = document.getElementById('logs-tbody');
+                const empty = document.getElementById('logs-empty');
+                const count = document.getElementById('log-count');
+
+                const rows = logs.slice(1).reverse(); // skip header row, newest first
+                count.textContent = `${rows.length} records`;
+
+                if (rows.length === 0) {
+                    tbody.innerHTML = '';
+                    empty.classList.remove('hidden');
+                    return;
                 }
-                if (devices.room2) {
-                    updateLight('room2', devices.room2.light || 'OFF');
-                    updateMotion('room2', devices.room2.motion || 'CLEAR');
-                }
-            }
 
-            function updateLight(room, state) {
-                const isOn = state === 'ON';
-                const card = document.getElementById(`light-card-${room}`);
-                const bar = document.getElementById(`light-bar-${room}`);
-                const dot = document.getElementById(`light-dot-${room}`);
-                const label = document.getElementById(`light-status-${room}`);
-                const icon = document.getElementById(`light-icon-${room}`);
-
-                card.classList.toggle('light-card-on', isOn);
-                bar.style.background = isOn ? 'linear-gradient(90deg,#22c55e,#16a34a)' : 'rgba(255,255,255,0.08)';
-                dot.className = 'status-dot ' + (isOn ? 'dot-on' : 'dot-off');
-                label.textContent = isOn ? 'ON' : 'OFF';
-                label.className = 'text-xs font-bold uppercase tracking-widest ' + (isOn ? 'text-green-400' : 'text-slate-400');
-                icon.textContent = isOn ? '💡' : '🔦';
-            }
-
-            function updateMotion(room, state) {
-                const detected = state === 'DETECTED';
-                const card = document.getElementById(`motion-card-${room}`);
-                const bar = document.getElementById(`motion-bar-${room}`);
-                const dot = document.getElementById(`motion-dot-${room}`);
-                const label = document.getElementById(`motion-status-${room}`);
-                const icon = document.getElementById(`motion-icon-${room}`);
-                const badge = document.getElementById(`motion-badge-${room}`);
-
-                card.classList.toggle('motion-detected', detected);
-                bar.style.background = detected ? 'linear-gradient(90deg,#ef4444,#dc2626)' : 'rgba(255,255,255,0.08)';
-                dot.className = 'status-dot ' + (detected ? 'dot-detected' : 'dot-clear');
-                label.textContent = detected ? 'DETECTED' : 'CLEAR';
-                label.className = 'text-xs font-bold uppercase tracking-widest ' + (detected ? 'text-red-400' : 'text-slate-400');
-                icon.textContent = detected ? '🚨' : '👁️';
-
-                if (detected) {
-                    badge.textContent = '⚠ Motion Detected!';
-                    badge.className = 'w-full text-center py-2.5 rounded-xl text-sm font-bold border border-red-500/30 text-red-300 bg-red-500/10';
-                } else {
-                    badge.textContent = 'No Motion';
-                    badge.className = 'w-full text-center py-2.5 rounded-xl text-sm font-bold border border-slate-600 text-slate-400 bg-slate-800/40';
-                }
-            }
-
-            function setMqttStatus(connected, label) {
-                const dot = document.getElementById('mqtt-dot');
-                const lbl = document.getElementById('mqtt-label');
-                dot.className = 'status-dot ' + (connected ? 'dot-mqtt-on' : 'dot-mqtt-off');
-                lbl.textContent = connected ? 'Connected' : (label || 'Disconnected');
-                lbl.className = connected ? 'text-green-400' : 'text-yellow-400';
-            }
-
-            // ── Light Control ────────────────────────────────────────────
-            async function controlLight(room, state) {
-                try {
-                    const res = await fetch('/api/control', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ room, state }),
-                    });
-                    const data = await res.json();
-                    if (data.success) updateLight(room, state);
-                } catch (e) {
-                    console.error('Control error:', e);
-                }
-            }
-
-            // ── Activity Logs ────────────────────────────────────────────
-            async function loadLogs() {
-                try {
-                    const res = await fetch('/api/logs');
-                    const data = await res.json();
-                    const logs = data.logs || [];
-
-                    const tbody = document.getElementById('logs-tbody');
-                    const empty = document.getElementById('logs-empty');
-                    const count = document.getElementById('log-count');
-
-                    const rows = logs.slice(1).reverse(); // skip header row, newest first
-                    count.textContent = `${rows.length} records`;
-
-                    if (rows.length === 0) {
-                        tbody.innerHTML = '';
-                        empty.classList.remove('hidden');
-                        return;
-                    }
-
-                    empty.classList.add('hidden');
-                    tbody.innerHTML = rows.map(([room, event, state, date, time]) => {
-                        const isMotion = event === 'Motion';
-                        const isDetected = state === 'DETECTED' || state === 'ON';
-                        const badgeClass = isDetected
-                            ? 'px-3 py-1 rounded-lg text-xs font-bold bg-red-500/15 text-red-300 border border-red-500/25'
-                            : 'px-3 py-1 rounded-lg text-xs font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
-                        return `
+                empty.classList.add('hidden');
+                tbody.innerHTML = rows.map(([room, event, state, date, time]) => {
+                    const isDetected = state === 'DETECTED' || state === 'ON';
+                    const badgeClass = isDetected
+                        ? 'px-3 py-1 rounded-lg text-xs font-bold bg-red-500/15 text-red-300 border border-red-500/25'
+                        : 'px-3 py-1 rounded-lg text-xs font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+                    return `
             <tr class="table-row border-white/5">
               <td class="px-8 py-5 text-white font-semibold">${room || '—'}</td>
               <td class="px-8 py-5 text-slate-300">${event || '—'}</td>
@@ -630,28 +686,25 @@
               <td class="px-8 py-5 text-slate-400 mono text-sm">${date || '—'}</td>
               <td class="px-8 py-5 text-slate-500 mono text-sm">${time || '—'}</td>
             </tr>`;
-                    }).join('');
-                } catch (e) {
-                    console.error('Logs error:', e);
-                }
+                }).join('');
+            } catch (e) {
+                console.error('Logs error:', e);
             }
+        }
 
-            // ── Page Navigation ──────────────────────────────────────────
-            function showPage(page) {
-                document.getElementById('page-home').classList.toggle('hidden', page !== 'home');
-                document.getElementById('page-logs').classList.toggle('hidden', page !== 'logs');
-                document.getElementById('btn-home').classList.toggle('active', page === 'home');
-                document.getElementById('btn-logs').classList.toggle('active', page === 'logs');
-                if (page === 'logs') loadLogs();
-            }
+        // ── Page Navigation ──────────────────────────────────────────
+        function showPage(page) {
+            document.getElementById('page-home').classList.toggle('hidden', page !== 'home');
+            document.getElementById('page-logs').classList.toggle('hidden', page !== 'logs');
+            document.getElementById('btn-home').classList.toggle('active', page === 'home');
+            document.getElementById('btn-logs').classList.toggle('active', page === 'logs');
+            if (page === 'logs') loadLogs();
+        }
 
-            // ── Init ─────────────────────────────────────────────────────
-            // Load initial state via REST when app initializes
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(d => { if (d.devices) updateAllDevices(d.devices); })
-                .catch(() => { });
-        } // end of initApp()
+        // ── Check session on load ────────────────────────────────────
+        if (TOKEN) {
+            showDashboard();
+        }
     </script>
 </body>
 
