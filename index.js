@@ -94,6 +94,7 @@ mqttClient.on('error', (err) => {
 
 mqttClient.on('message', async (topic, payloadRaw) => {
   const payload = payloadRaw.toString().trim();
+  console.log(`[MQTT Received] ${topic} -> ${payload}`);
 
   if (topic === 'home/room1/motion') {
     deviceState.room1.motion = payload;
